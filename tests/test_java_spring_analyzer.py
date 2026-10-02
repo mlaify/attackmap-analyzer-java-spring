@@ -70,11 +70,8 @@ def test_spring_get_post_extracted_with_class_prefix(tmp_path: Path) -> None:
     pairs = sorted({(r.path, r.method) for r in result.routes})
     assert ("/api/users/{id}", "GET") in pairs
     assert ("/api/users/{id}", "DELETE") in pairs
-    # @PostMapping with no value — class prefix alone.
-    # _join_paths("/api/users", "") → "/api/users"
-    # But @PostMapping with no argument doesn't match SPRING_METHOD_MAPPING_PATTERN (which requires
-    # a path arg), so the bare @PostMapping doesn't currently produce a route. That's a known gap.
-    # Verify the others did fire correctly:
+    # Bare @PostMapping maps to the class prefix alone (#2).
+    assert ("/api/users", "POST") in pairs
     assert any(r.method == "GET" and r.path == "/api/users/{id}" for r in result.routes)
 
 
@@ -546,3 +543,208 @@ def test_symlinked_file_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
     result = analyzer.analyze(repo)
     assert result.files_scanned == 0
     assert result.routes == []
+
+
+# ---------- Annotation argument shapes (#2) ----------
+
+
+def _routes(result) -> set[tuple[str, str]]:
+    return {(r.method, r.path) for r in result.routes}
+
+
+def test_spring_issue_controller_produces_all_routes_with_prefix(tmp_path: Path) -> None:
+    """The 5-endpoint controller from #2: path= at class and method level, bare
+    @GetMapping, array @PostMapping and a plain @DeleteMapping."""
+    (tmp_path / "UserController.java").write_text(
+        'import org.springframework.web.bind.annotation.*;\n'
+        '\n'
+        '@RestController\n'
+        '@RequestMapping(path = "/api/users")\n'
+        'public class UserController {\n'
+        '    @GetMapping\n'
+        '    public List<User> list() { return null; }\n'
+        '\n'
+        '    @GetMapping(path = "/{id}")\n'
+        '    public User get(@PathVariable Long id) { return null; }\n'
+        '\n'
+        '    @PostMapping({"/a", "/b"})\n'
+        '    public User create(@RequestBody User u) { return null; }\n'
+        '\n'
+        '    @DeleteMapping("/{id}")\n'
+        '    public void delete(@PathVariable Long id) {}\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert _routes(result) == {
+        ("GET", "/api/users"),
+        ("GET", "/api/users/{id}"),
+        ("POST", "/api/users/a"),
+        ("POST", "/api/users/b"),
+        ("DELETE", "/api/users/{id}"),
+    }
+    lines = {(r.method, r.path): r.line for r in result.routes}
+    assert lines[("GET", "/api/users")] == 6
+    assert lines[("POST", "/api/users/b")] == 12
+
+
+def test_spring_request_mapping_method_array_and_class_value_array(tmp_path: Path) -> None:
+    (tmp_path / "Multi.java").write_text(
+        'import org.springframework.web.bind.annotation.*;\n'
+        '@RestController\n'
+        '@RequestMapping(value = {"/v1/items", "/v2/items"})\n'
+        '@Validated\n'
+        'public class Multi {\n'
+        '    @RequestMapping(path = "/{id}", method = {RequestMethod.GET, RequestMethod.HEAD})\n'
+        '    public Item get() { return null; }\n'
+        '    @RequestMapping("/sync")\n'
+        '    public void sync() {}\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert _routes(result) == {
+        ("GET", "/v1/items/{id}"),
+        ("HEAD", "/v1/items/{id}"),
+        ("GET", "/v2/items/{id}"),
+        ("HEAD", "/v2/items/{id}"),
+        ("ANY", "/v1/items/sync"),
+        ("ANY", "/v2/items/sync"),
+    }
+
+
+def test_spring_class_without_mapping_does_not_inherit_previous_prefix(tmp_path: Path) -> None:
+    (tmp_path / "Two.java").write_text(
+        'import org.springframework.web.bind.annotation.*;\n'
+        '@RequestMapping("/api/a")\n'
+        'class A {\n'
+        '    @GetMapping("/x")\n'
+        '    public Object x() { return "{"; }\n'
+        '}\n'
+        '@RestController\n'
+        'class B {\n'
+        '    // @GetMapping("/commented-out")\n'
+        '    @GetMapping("/y")\n'
+        '    public Object y() { return null; }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert _routes(result) == {("GET", "/api/a/x"), ("GET", "/y")}
+
+
+def test_spring_mapping_with_constant_path_is_skipped_not_misattributed(tmp_path: Path) -> None:
+    (tmp_path / "C.java").write_text(
+        'import org.springframework.web.bind.annotation.*;\n'
+        '@RequestMapping("/api")\n'
+        'class C {\n'
+        '    @GetMapping(Paths.STATUS)\n'
+        '    public Object status() { return null; }\n'
+        '    @GetMapping(value = "/ok", produces = "application/json")\n'
+        '    public Object ok() { return null; }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert _routes(result) == {("GET", "/api/ok")}
+
+
+def test_spring_kotlin_array_forms(tmp_path: Path) -> None:
+    (tmp_path / "UserController.kt").write_text(
+        'import org.springframework.web.bind.annotation.*\n'
+        '\n'
+        '@RestController\n'
+        '@RequestMapping(path = ["/api/users"])\n'
+        'class UserController(private val repo: UserRepository) {\n'
+        '    @GetMapping\n'
+        '    fun list(): List<User> = repo.findAll()\n'
+        '\n'
+        '    @GetMapping(value = ["/{id}", "/by-id/{id}"])\n'
+        '    fun get(@PathVariable id: Long): User = repo.get(id)\n'
+        '\n'
+        '    @PostMapping(path = arrayOf("/a", "/b"))\n'
+        '    fun create(@RequestBody u: User): User = repo.save(u)\n'
+        '\n'
+        '    @PutMapping("/x", "/y")\n'
+        '    fun put(): Unit {}\n'
+        '\n'
+        '    @RequestMapping(value = ["/legacy"], method = [RequestMethod.PATCH])\n'
+        '    fun legacy(): Unit {}\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert _routes(result) == {
+        ("GET", "/api/users"),
+        ("GET", "/api/users/{id}"),
+        ("GET", "/api/users/by-id/{id}"),
+        ("POST", "/api/users/a"),
+        ("POST", "/api/users/b"),
+        ("PUT", "/api/users/x"),
+        ("PUT", "/api/users/y"),
+        ("PATCH", "/api/users/legacy"),
+    }
+
+
+def test_micronaut_bare_get_value_and_uri_forms(tmp_path: Path) -> None:
+    (tmp_path / "BookController.java").write_text(
+        'import io.micronaut.http.annotation.*;\n'
+        '\n'
+        '@Controller(value = "/books")\n'
+        'public class BookController {\n'
+        '    @Get\n'
+        '    public List<Book> list() { return null; }\n'
+        '\n'
+        '    @Get(value = "/{id}")\n'
+        '    public Book get(Long id) { return null; }\n'
+        '\n'
+        '    @Post(uri = "/import")\n'
+        '    public void importBooks() {}\n'
+        '\n'
+        '    @Delete(uris = {"/{id}", "/remove/{id}"})\n'
+        '    public void delete(Long id) {}\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert _routes(result) == {
+        ("GET", "/books"),
+        ("GET", "/books/{id}"),
+        ("POST", "/books/import"),
+        ("DELETE", "/books/{id}"),
+        ("DELETE", "/books/remove/{id}"),
+    }
+
+
+def test_micronaut_bare_controller_mounts_at_root(tmp_path: Path) -> None:
+    (tmp_path / "Health.kt").write_text(
+        'import io.micronaut.http.annotation.*\n'
+        '\n'
+        '@Controller\n'
+        'class Health {\n'
+        '    @Get("/health")\n'
+        '    fun health() = "ok"\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert _routes(result) == {("GET", "/health")}
+
+
+def test_jaxrs_value_attribute_and_class_scoped_path(tmp_path: Path) -> None:
+    (tmp_path / "Res.java").write_text(
+        'import jakarta.ws.rs.*;\n'
+        '\n'
+        '@Path(value = "/orders")\n'
+        'public class Res {\n'
+        '    @GET\n'
+        '    public List<Order> list() { return null; }\n'
+        '\n'
+        '    @DELETE\n'
+        '    @Path("{id}")\n'
+        '    public void delete() {}\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert _routes(result) == {("GET", "/orders"), ("DELETE", "/orders/{id}")}

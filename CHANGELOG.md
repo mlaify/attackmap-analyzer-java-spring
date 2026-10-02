@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Spring MVC mappings are read with an annotation-argument parser instead of
+  single-string regexes, so these shapes now produce routes with the right
+  path ([#2](https://github.com/mlaify/attackmap-analyzer-java-spring/issues/2)):
+  bare `@GetMapping` (the class prefix alone), `path = "/x"`, arrays
+  (`@PostMapping({"/a", "/b"})`, Kotlin `["/a"]`, `arrayOf("/a")` and vararg
+  `@PutMapping("/a", "/b")`), `method = {RequestMethod.GET, ...}`, and a
+  class-level `@RequestMapping(path = ...)` prefix. A `@Validated` (or any
+  other annotation) between `@RequestMapping` and `class` no longer hides the
+  prefix.
+- A class prefix applies only inside its own class body; a second class in
+  the file without a mapping no longer inherits the first class's prefix.
+- Micronaut: bare `@Get`, `value =`, `uri =` and `uris = {...}` are read, and a
+  bare `@Controller` mounts at `/`. JAX-RS `@Path(value = ...)` is read and the
+  class path comes from the class's own `@Path`.
+- Mappings inside comments are ignored, and a mapping whose path is a constant
+  (`@GetMapping(Paths.X)`) is skipped rather than reported under the
+  class prefix. Annotation-derived paths always start with `/`.
 - A repo checked out under a directory named like a skip dir (e.g. `/build/...`,
   `.../out/...`) was silently skipped entirely; skip dirs are now matched only
   inside the repo.
