@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -43,17 +45,11 @@ from .contracts import (
 )
 
 CODE_SUFFIXES = {".java", ".kt", ".kts"}
-SKIP_DIRS = {
-    "target",       # Maven build output
-    "build",        # Gradle build output
-    ".gradle",
-    ".mvn",
-    ".idea",
-    ".git",
-    "out",
-    "bin",
-    "node_modules",
-}
+# JVM-specific directories on top of the SDK defaults (which already cover
+# Maven target/, Gradle build/, out/, .git and node_modules). Matched against
+# directory names inside the repo only (mlaify/AttackMap#253).
+SKIP_DIRS = DEFAULT_SKIP_DIRS | {".gradle", ".mvn", ".idea", "bin"}
+BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts"}
 _SNIPPET_MAX_CHARS = 160
 
 
@@ -192,12 +188,10 @@ SECRET_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-def _line_of(content: str, offset: int) -> int:
-    if offset <= 0:
-        return 1
-    return content.count("\n", 0, offset) + 1
-
-
+# Kept rather than attackmap.sdk.line_snippet: this takes a match offset and
+# splits on "\n" only, so it stays consistent with line_of() on files that
+# contain form feeds or other str.splitlines() separators, and it costs
+# O(line) per match instead of O(file).
 def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CHARS) -> str:
     line_start = content.rfind("\n", 0, offset) + 1
     line_end = content.find("\n", offset)
@@ -248,12 +242,9 @@ def _active_class_prefix(prefixes: list[tuple[int, str]], offset: int) -> str:
     return active
 
 
-def _module_name_from_pom(pom_path: Path) -> str | None:
-    if not pom_path.exists():
-        return None
-    try:
-        text = pom_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+def _module_name_from_pom(pom_path: Path, root: Path | None = None) -> str | None:
+    text = read_source(pom_path, root=root)
+    if text is None:
         return None
     artifact = re.search(r"<artifactId>([^<]+)</artifactId>", text)
     if artifact:
@@ -263,12 +254,8 @@ def _module_name_from_pom(pom_path: Path) -> str | None:
 
 def _module_name_from_gradle(root: Path) -> str | None:
     for candidate in ("settings.gradle", "settings.gradle.kts"):
-        path = root / candidate
-        if not path.exists():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        text = read_source(root / candidate, root=root)
+        if text is None:
             continue
         match = re.search(r'rootProject\.name\s*=\s*[\'"]([^\'"]+)[\'"]', text)
         if match:
@@ -283,12 +270,8 @@ def _spring_app_name_from_properties(root: Path) -> str | None:
         "application.properties",
         "application.yml",
     ):
-        path = root / candidate
-        if not path.exists():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        text = read_source(root / candidate, root=root)
+        if text is None:
             continue
         match = re.search(r'^\s*spring\.application\.name\s*[:=]\s*([^\s#]+)', text, re.MULTILINE)
         if match:
@@ -305,7 +288,9 @@ class JavaSpringAnalyzer:
         scope="Maven, Gradle, and Kotlin Spring Boot projects. Detects Spring MVC, JAX-RS, Ktor, Javalin, and Micronaut routing.",
         targets=["java", "kotlin", "spring", "spring-boot"],
         languages=["java", "kotlin"],
-        priority=20,
+        # Framework band (50-149): core runs analyzers in (priority, name) order
+        # across built-ins and plugins, and merge is first-seen-wins.
+        priority=60,
         experimental=False,
         enabled_by_default=True,
     )
@@ -323,14 +308,8 @@ class JavaSpringAnalyzer:
         for marker in ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"):
             if (root / marker).exists():
                 return True
-        for path in root.rglob("*"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            if path.is_file() and path.suffix in CODE_SUFFIXES:
-                return True
-            if path.is_file() and path.name in {"pom.xml", "build.gradle", "build.gradle.kts"}:
-                return True
-        return False
+        # Any nested source or build file; stop at the first one.
+        return next(iter_repo_files(root, suffixes=CODE_SUFFIXES, names=BUILD_FILES, skip_dirs=SKIP_DIRS), None) is not None
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
         root = Path(repo_path).resolve()
@@ -339,7 +318,7 @@ class JavaSpringAnalyzer:
             return result
 
         # Service-name hints from build/application metadata
-        artifact = _module_name_from_pom(root / "pom.xml")
+        artifact = _module_name_from_pom(root / "pom.xml", root)
         gradle_name = _module_name_from_gradle(root)
         spring_app = _spring_app_name_from_properties(root)
         if artifact:
@@ -349,25 +328,17 @@ class JavaSpringAnalyzer:
         if spring_app:
             self._append_unique_service(result, f"spring_app:{spring_app}", "application.properties")
 
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
-                continue
-            if file_path.suffix not in CODE_SUFFIXES:
+        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+            content = read_source(file_path, root=root)
+            if content is None:
                 continue
 
             result.files_scanned += 1
-            language = "kotlin" if file_path.suffix in {".kt", ".kts"} else "java"
+            language = "kotlin" if file_path.suffix.lower() in {".kt", ".kts"} else "java"
             if language not in result.languages:
                 result.languages.append(language)
 
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_routes(content, relative, result)
             self._extract_databases(content, relative, result)
             self._extract_auth(content, relative, result)
@@ -391,7 +362,7 @@ class JavaSpringAnalyzer:
             method = verb.upper()
             prefix = _active_class_prefix(class_prefixes, match.start())
             full_path = _join_paths(prefix, suffix)
-            self._append_unique_route(result, full_path, method, relative, _line_of(content, match.start()))
+            self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
 
         # Method-level @RequestMapping with explicit method = RequestMethod.X
         for match in SPRING_REQUEST_MAPPING_PATTERN.finditer(content):
@@ -403,7 +374,7 @@ class JavaSpringAnalyzer:
             methods = _spring_method_from_request_mapping(rest)
             prefix = _active_class_prefix(class_prefixes, match.start())
             full_path = _join_paths(prefix, suffix)
-            line = _line_of(content, match.start())
+            line = line_of(content, match.start())
             for method in methods:
                 self._append_unique_route(result, full_path, method, relative, line)
 
@@ -431,11 +402,11 @@ class JavaSpringAnalyzer:
                 method = verb_match.group(1)
                 if best_path is not None:
                     method_path = best_path.group(1)
-                    line = _line_of(content, best_path.start())
+                    line = line_of(content, best_path.start())
                 else:
                     # No method-level @Path — the verb applies to the class-level path.
                     method_path = ""
-                    line = _line_of(content, verb_match.start())
+                    line = line_of(content, verb_match.start())
                 full_path = _join_paths(class_path, method_path)
                 self._append_unique_route(result, full_path, method, relative, line)
 
@@ -443,13 +414,13 @@ class JavaSpringAnalyzer:
         if "io.ktor" in content or "ktor.server.routing" in content:
             for match in KTOR_ROUTE_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # Javalin: app.get("/x", ...)
         if "io.javalin" in content or "Javalin.create" in content:
             for match in JAVALIN_ROUTE_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # Micronaut: @Controller("/x") + method @Get/@Post
         if "io.micronaut" in content:
@@ -458,7 +429,7 @@ class JavaSpringAnalyzer:
             for match in MICRONAUT_METHOD_PATTERN.finditer(content):
                 method, suffix = match.group(1).upper(), match.group(2)
                 full_path = _join_paths(class_path, suffix)
-                self._append_unique_route(result, full_path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -467,7 +438,7 @@ class JavaSpringAnalyzer:
                 continue
             self._append_unique_database(
                 result, kind, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -478,7 +449,7 @@ class JavaSpringAnalyzer:
                 continue
             self._append_unique_auth(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
                 confidence,
             )
@@ -490,7 +461,7 @@ class JavaSpringAnalyzer:
                 name = groups[0] if groups and groups[0] else "unknown"
                 self._append_unique_secret(
                     result, name, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -502,7 +473,7 @@ class JavaSpringAnalyzer:
                     continue
                 self._append_unique_external(
                     result, target, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -513,7 +484,7 @@ class JavaSpringAnalyzer:
                 continue
             self._append_unique_framework(
                 result, name, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -524,7 +495,7 @@ class JavaSpringAnalyzer:
                 continue
             self._append_unique_entrypoint(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 

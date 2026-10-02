@@ -6,6 +6,7 @@ on the resulting ScanResult.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -498,3 +499,50 @@ def test_full_spring_boot_service_signal_set(tmp_path: Path) -> None:
     assert any(h.hint == "artifact:orders" for h in result.service_hints)
 
     assert all(r.line is not None for r in result.routes)
+
+
+# ---------- Repo walking (mlaify/AttackMap#253) ----------
+
+
+def _write_spring_controller(src_dir: Path) -> Path:
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "UserController.java"
+    src.write_text(
+        'package com.example;\n'
+        '\n'
+        'import org.springframework.web.bind.annotation.*;\n'
+        '\n'
+        '@RestController\n'
+        '@RequestMapping("/api/users")\n'
+        'public class UserController {\n'
+        '    @GetMapping("/{id}")\n'
+        '    public Object getUser(@PathVariable Long id) { return null; }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    return src
+
+
+@pytest.mark.parametrize("parents", [("build", "out"), ("target", "bin")])
+def test_repo_under_skip_dir_names_is_still_analyzed(tmp_path: Path, parents: tuple[str, str]) -> None:
+    # These are skip dirs; they must only count inside the repo.
+    repo = tmp_path.joinpath(*parents, "repo")
+    _write_spring_controller(repo / "src" / "main" / "java")
+    analyzer = JavaSpringAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 1
+    assert ("/api/users/{id}", "GET") in {(r.path, r.method) for r in result.routes}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_file_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
+    target = _write_spring_controller(tmp_path / "outside")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "Linked.java").symlink_to(target)
+    analyzer = JavaSpringAnalyzer()
+    assert analyzer.detect(repo) is False
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 0
+    assert result.routes == []
