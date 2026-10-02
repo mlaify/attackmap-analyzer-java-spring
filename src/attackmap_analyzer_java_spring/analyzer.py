@@ -18,10 +18,12 @@ Coverage (v0.1):
 - Service hints: artifactId/groupId from pom.xml, rootProject.name from
   build.gradle, spring.application.name from application.properties/yml
 
-Class-level @RequestMapping prefixes are joined with method-level
-@GetMapping / @PostMapping etc. to produce the full route path. Multiple
-classes per file are tracked correctly (each class's prefix only applies
-to methods that follow it).
+Class-level @RequestMapping (Spring), @Path (JAX-RS) and @Controller
+(Micronaut) prefixes are joined with member mappings to produce the full route
+path. Annotation arguments are parsed (bare, positional, `value=`/`path=`/
+`uri=`, Java `{...}` and Kotlin `[...]`/`arrayOf(...)` arrays, `method =`
+lists) by `annotations.py`, and a class prefix applies only inside that class's
+body (found by brace matching).
 """
 
 from __future__ import annotations
@@ -30,6 +32,17 @@ import re
 from pathlib import Path
 
 from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
+from .annotations import (
+    Annotation,
+    AnnotationBlock,
+    annotation_paths,
+    class_scopes,
+    find_annotations,
+    group_blocks,
+    innermost_scope,
+    mask_comments,
+)
 
 from .contracts import (
     AnalyzerMetadata,
@@ -55,27 +68,32 @@ _SNIPPET_MAX_CHARS = 160
 
 # ---------- Patterns ----------
 
-# Spring MVC method-level mappings: @GetMapping("/x"), @PostMapping(value = "/x"), etc.
-SPRING_METHOD_MAPPING_PATTERN = re.compile(
-    r'@(Get|Post|Put|Delete|Patch)Mapping\s*\(\s*(?:value\s*=\s*)?"([^"]+)"',
+# Spring MVC, JAX-RS and Micronaut routes are read with the annotation reader
+# in `annotations.py` (#2): bare mappings, `value=`/`path=`/`uri=`, arrays
+# (`{"/a", "/b"}`, Kotlin `["/a"]` / `arrayOf("/a")`) and
+# `method = {RequestMethod.X, ...}`.
+SPRING_VERB_MAPPINGS = {
+    "GetMapping": "GET",
+    "PostMapping": "POST",
+    "PutMapping": "PUT",
+    "DeleteMapping": "DELETE",
+    "PatchMapping": "PATCH",
+}
+SPRING_PATH_KEYS = ("value", "path")
+JAXRS_VERBS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
+MICRONAUT_VERBS = {
+    "Get": "GET",
+    "Post": "POST",
+    "Put": "PUT",
+    "Delete": "DELETE",
+    "Patch": "PATCH",
+    "Head": "HEAD",
+    "Options": "OPTIONS",
+}
+MICRONAUT_PATH_KEYS = ("value", "uri", "uris")
+ROUTE_ANNOTATIONS = frozenset(
+    {*SPRING_VERB_MAPPINGS, "RequestMapping", "Path", *JAXRS_VERBS, *MICRONAUT_VERBS, "Controller"}
 )
-# @RequestMapping("/x", method = RequestMethod.GET)  — method-level, with explicit method.
-SPRING_REQUEST_MAPPING_PATTERN = re.compile(
-    r'@RequestMapping\s*\(\s*'
-    r'(?:value\s*=\s*)?"([^"]+)"'
-    r'(?P<rest>[^)]*)\)',
-    re.DOTALL,
-)
-# @RequestMapping("/x") — class-level form; we recognize class-level by lookahead for `class `.
-SPRING_CLASS_REQUEST_MAPPING_PATTERN = re.compile(
-    r'@RequestMapping\s*\(\s*(?:value\s*=\s*)?"([^"]+)"[^)]*\)\s*'
-    r'(?:@\w+(?:\([^)]*\))?\s*)*'
-    r'(?:public\s+|abstract\s+|final\s+|@\w+\s+)*class\s+\w+',
-    re.DOTALL,
-)
-# JAX-RS / Jersey / Quarkus
-JAXRS_PATH_PATTERN = re.compile(r'@Path\s*\(\s*"([^"]+)"\s*\)')
-JAXRS_METHOD_PATTERN = re.compile(r'@(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b')
 
 # Ktor (Kotlin): get("/x") { ... } inside `routing { ... }`.
 KTOR_ROUTE_PATTERN = re.compile(
@@ -87,18 +105,11 @@ JAVALIN_ROUTE_PATTERN = re.compile(
     r'\bapp\.(get|post|put|delete|patch|head|options)\s*\(\s*"([^"]+)"',
 )
 
-# Micronaut: @Controller("/x") + @Get / @Post / ...
-MICRONAUT_CLASS_PATTERN = re.compile(r'@Controller\s*\(\s*(?:value\s*=\s*)?"([^"]+)"')
-MICRONAUT_METHOD_PATTERN = re.compile(
-    r'@(Get|Post|Put|Delete|Patch)\s*\(\s*(?:value\s*=\s*)?"([^"]+)"',
-)
-
-
-def _spring_method_from_request_mapping(rest: str) -> list[str]:
-    methods: list[str] = []
-    for match in re.finditer(r'RequestMethod\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)', rest):
-        methods.append(match.group(1).upper())
-    return methods or ["ANY"]
+def _spring_methods(annotation: Annotation) -> list[str]:
+    """HTTP methods of a `@RequestMapping` (`method = RequestMethod.X` or an array)."""
+    value = annotation.named.get("method", "")
+    methods = re.findall(r"RequestMethod\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b", value)
+    return list(dict.fromkeys(methods)) or ["ANY"]
 
 
 # External HTTP calls
@@ -218,28 +229,10 @@ def _join_paths(prefix: str, suffix: str) -> str:
     return p.rstrip("/") + "/" + s.lstrip("/")
 
 
-def _class_prefixes_in_file(content: str) -> list[tuple[int, str]]:
-    """Return [(start_offset, prefix), ...] for every class-level @RequestMapping in the file.
-
-    A class-level mapping is one whose annotation precedes a `class Foo` declaration
-    (with at most other annotations/modifiers in between). Order matters — when a
-    method-level mapping is at offset N, we use the *latest* class prefix at offset < N.
-    """
-    prefixes: list[tuple[int, str]] = []
-    for match in SPRING_CLASS_REQUEST_MAPPING_PATTERN.finditer(content):
-        prefixes.append((match.start(), match.group(1)))
-    return prefixes
-
-
-def _active_class_prefix(prefixes: list[tuple[int, str]], offset: int) -> str:
-    """Find the most recent class prefix preceding the given offset."""
-    active = ""
-    for start, prefix in prefixes:
-        if start < offset:
-            active = prefix
-        else:
-            break
-    return active
+def _route_path(prefix: str, suffix: str) -> str:
+    """Join a class path and a member path, normalized to a leading `/`."""
+    path = _join_paths(prefix, suffix)
+    return path if path.startswith("/") else "/" + path
 
 
 def _module_name_from_pom(pom_path: Path, root: Path | None = None) -> str | None:
@@ -277,6 +270,50 @@ def _spring_app_name_from_properties(root: Path) -> str | None:
         if match:
             return match.group(1).strip().strip("'\"")
     return None
+
+
+def _class_block_paths(block: AnnotationBlock, is_jaxrs: bool, is_micronaut: bool) -> list[str] | None:
+    """Path prefixes a class-level annotation block declares, or None for none."""
+    for annotation in block.get("RequestMapping"):
+        return annotation_paths(annotation, SPRING_PATH_KEYS)
+    if is_jaxrs:
+        for annotation in block.get("Path"):
+            return annotation_paths(annotation, ("value",))
+    if is_micronaut:
+        for annotation in block.get("Controller"):
+            paths = annotation_paths(annotation, MICRONAUT_PATH_KEYS)
+            # A bare Micronaut @Controller is mounted at "/".
+            return paths if paths != [""] else ["/"]
+    return None
+
+
+def _member_routes(
+    block: AnnotationBlock, is_jaxrs: bool, is_micronaut: bool
+) -> list[tuple[Annotation, str, list[str]]]:
+    """(anchor annotation, HTTP method, member paths) for a member's block."""
+    routes: list[tuple[Annotation, str, list[str]]] = []
+    for annotation in block.annotations:
+        if annotation.name in SPRING_VERB_MAPPINGS:
+            paths = annotation_paths(annotation, SPRING_PATH_KEYS)
+            if paths is not None:
+                routes.append((annotation, SPRING_VERB_MAPPINGS[annotation.name], paths))
+        elif annotation.name == "RequestMapping":
+            paths = annotation_paths(annotation, SPRING_PATH_KEYS)
+            if paths is not None:
+                routes.extend((annotation, method, paths) for method in _spring_methods(annotation))
+        elif is_micronaut and annotation.name in MICRONAUT_VERBS:
+            paths = annotation_paths(annotation, MICRONAUT_PATH_KEYS)
+            if paths is not None:
+                routes.append((annotation, MICRONAUT_VERBS[annotation.name], paths))
+    if is_jaxrs:
+        verbs = [a for a in block.annotations if a.name in JAXRS_VERBS and a.args is None]
+        if verbs:
+            path_annotation = next(iter(block.get("Path")), None)
+            paths = annotation_paths(path_annotation, ("value",)) if path_annotation else [""]
+            if paths is not None:
+                anchor = path_annotation or verbs[0]
+                routes.extend((anchor, verb.name, paths) for verb in verbs)
+    return routes
 
 
 class JavaSpringAnalyzer:
@@ -354,61 +391,7 @@ class JavaSpringAnalyzer:
     # ---------- Extractors ----------
 
     def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
-        # Spring: class-level @RequestMapping prefix + method-level @GetMapping etc.
-        class_prefixes = _class_prefixes_in_file(content)
-
-        for match in SPRING_METHOD_MAPPING_PATTERN.finditer(content):
-            verb, suffix = match.group(1), match.group(2)
-            method = verb.upper()
-            prefix = _active_class_prefix(class_prefixes, match.start())
-            full_path = _join_paths(prefix, suffix)
-            self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
-
-        # Method-level @RequestMapping with explicit method = RequestMethod.X
-        for match in SPRING_REQUEST_MAPPING_PATTERN.finditer(content):
-            # Skip class-level mappings — they're handled as prefixes, not routes themselves.
-            if (match.start(), match.group(1)) in [(p[0], p[1]) for p in class_prefixes]:
-                continue
-            suffix = match.group(1)
-            rest = match.group("rest") or ""
-            methods = _spring_method_from_request_mapping(rest)
-            prefix = _active_class_prefix(class_prefixes, match.start())
-            full_path = _join_paths(prefix, suffix)
-            line = line_of(content, match.start())
-            for method in methods:
-                self._append_unique_route(result, full_path, method, relative, line)
-
-        # JAX-RS: class-level @Path("/x") + method-level @Path("/y") + @GET/@POST/...
-        # In typical JAX-RS code, the verb annotation can come *before* or *after* the
-        # method-level @Path (`@GET\n@Path("/{id}")` is just as common as the inverse).
-        # We pair each verb annotation with the @Path it sits closest to within a window.
-        if "javax.ws.rs" in content or "jakarta.ws.rs" in content:
-            path_matches = list(JAXRS_PATH_PATTERN.finditer(content))
-            verb_matches = list(JAXRS_METHOD_PATTERN.finditer(content))
-            class_path = path_matches[0].group(1) if path_matches else ""
-            class_path_offset = path_matches[0].start() if path_matches else -1
-            for verb_match in verb_matches:
-                # Find the @Path annotation closest to this verb (excluding the class-level
-                # one) within a 400-char proximity window — that's "the same method block".
-                best_path: re.Match | None = None
-                best_distance = 401
-                for path_match in path_matches:
-                    if path_match.start() == class_path_offset:
-                        continue
-                    distance = abs(path_match.start() - verb_match.start())
-                    if distance < best_distance:
-                        best_distance = distance
-                        best_path = path_match
-                method = verb_match.group(1)
-                if best_path is not None:
-                    method_path = best_path.group(1)
-                    line = line_of(content, best_path.start())
-                else:
-                    # No method-level @Path — the verb applies to the class-level path.
-                    method_path = ""
-                    line = line_of(content, verb_match.start())
-                full_path = _join_paths(class_path, method_path)
-                self._append_unique_route(result, full_path, method, relative, line)
+        self._extract_annotation_routes(content, relative, result)
 
         # Ktor: routing { get("/x") { ... } }
         if "io.ktor" in content or "ktor.server.routing" in content:
@@ -422,14 +405,45 @@ class JavaSpringAnalyzer:
                 method, path = match.group(1).upper(), match.group(2)
                 self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
-        # Micronaut: @Controller("/x") + method @Get/@Post
-        if "io.micronaut" in content:
-            class_match = MICRONAUT_CLASS_PATTERN.search(content)
-            class_path = class_match.group(1) if class_match else ""
-            for match in MICRONAUT_METHOD_PATTERN.finditer(content):
-                method, suffix = match.group(1).upper(), match.group(2)
-                full_path = _join_paths(class_path, suffix)
-                self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
+    def _extract_annotation_routes(self, content: str, relative: str, result: ScanResult) -> None:
+        """Spring MVC, JAX-RS and Micronaut annotation routes (#2).
+
+        Each annotation block is attributed to a class (its paths become the
+        prefix for that class body, found by brace matching) or to a member
+        (a route under the innermost enclosing class's prefixes).
+        """
+        if "@" not in content:
+            return
+        is_jaxrs = "javax.ws.rs" in content or "jakarta.ws.rs" in content
+        is_micronaut = "io.micronaut" in content
+        masked = mask_comments(content)
+        # Group every annotation (not just route ones) so `@Validated` between
+        # `@RequestMapping` and `class` keeps the block on the class.
+        annotations = find_annotations(masked)
+        if not any(a.name in ROUTE_ANNOTATIONS for a in annotations):
+            return
+        blocks = group_blocks(masked, annotations)
+        scopes = class_scopes(masked)
+
+        # Class keyword offset -> that class's path prefixes.
+        class_paths: dict[int, list[str]] = {}
+        for block in blocks:
+            if block.class_keyword_at is None:
+                continue
+            prefixes = _class_block_paths(block, is_jaxrs, is_micronaut)
+            if prefixes is not None:
+                class_paths[block.class_keyword_at] = prefixes
+
+        for block in blocks:
+            if block.class_keyword_at is not None:
+                continue
+            scope = innermost_scope(scopes, block.annotations[0].start)
+            prefixes = class_paths.get(scope.keyword_at, [""]) if scope is not None else [""]
+            for annotation, method, paths in _member_routes(block, is_jaxrs, is_micronaut):
+                line = line_of(content, annotation.start)
+                for prefix in prefixes:
+                    for suffix in paths:
+                        self._append_unique_route(result, _route_path(prefix, suffix), method, relative, line)
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
