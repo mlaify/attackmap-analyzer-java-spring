@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `@DenyAll`, `@PermitAll`). The result is set on `Route.auth` / `guards` /
   `guard_evidence` (mlaify/AttackMap#256), so `requestMatchers("/admin/**").permitAll()`
   now makes those routes explicitly anonymous with the rule as evidence.
+  A route is never marked `required` when Spring would let some request to
+  it through anonymously. That covers route `**` wildcards, the Boot 2
+  trailing-slash form of exact Ant patterns, `HEAD` on `GET` handlers,
+  ANONYMOUS authorities and SpEL `or`, method security that isn't switched on,
+  `@PostAuthorize`, and `params=` handler variants. Applying rules to routes
+  shares a per-repo evaluation budget.
 
 ### Changed
 

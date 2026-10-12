@@ -37,7 +37,7 @@ the result is recorded on `Route.auth` / `guards` / `guard_evidence`.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
@@ -55,14 +55,19 @@ from .annotations import (
 from .functional import FUNCTIONAL_GATE_RE, functional_routes
 from .security_dsl import (
     ANONYMOUS,
+    ANONYMOUS_AUTHORITY_RE,
     REQUIRED,
     SECURITY_GATE_RE,
+    UNKNOWN,
+    Budget,
+    BudgetExceeded,
     FileSecurity,
     Resolution,
     Rule,
     SecurityChain,
     parse_security,
     resolve_route,
+    spel_decision,
 )
 
 from .contracts import (
@@ -126,13 +131,31 @@ JAVALIN_ROUTE_PATTERN = re.compile(
     r'\bapp\.(get|post|put|delete|patch|head|options)\s*\(\s*"([^"]+)"',
 )
 
-# Method security annotations (Spring and JSR-250) on a handler or its class.
-METHOD_SECURITY_ANNOTATIONS = frozenset({"PreAuthorize", "PostAuthorize", "Secured", "RolesAllowed", "DenyAll", "PermitAll"})
-_METHOD_SECURITY_PERMIT_RE = re.compile(r"\b(?:permitAll|isAnonymous|IS_AUTHENTICATED_ANONYMOUSLY)\b")
-_METHOD_SECURITY_REQUIRED_RE = re.compile(
-    r"\b(?:hasRole|hasAnyRole|hasAuthority|hasAnyAuthority|hasPermission|isAuthenticated|"
-    r"isFullyAuthenticated|isRememberMe|denyAll|authentication|principal|ROLE_\w+|"
-    r"IS_AUTHENTICATED_FULLY|IS_AUTHENTICATED_REMEMBERED)\b"
+# Method security annotations (Spring and JSR-250) on a handler or its class,
+# and the switch family that turns each on. `@PostAuthorize` / `@PostFilter` run
+# after the handler, so they never guard against its side effects.
+PREPOST, SECURED, JSR250 = "prePost", "secured", "jsr250"
+METHOD_SECURITY_FAMILIES = {
+    "PreAuthorize": PREPOST,
+    "Secured": SECURED,
+    "RolesAllowed": JSR250,
+    "DenyAll": JSR250,
+    "PermitAll": JSR250,
+}
+ENABLE_METHOD_SECURITY = frozenset({"EnableMethodSecurity", "EnableGlobalMethodSecurity", "EnableReactiveMethodSecurity"})
+# JAX-RS runtimes that enforce @RolesAllowed themselves: Jersey's feature, Quarkus security.
+JAXRS_ROLES_RE = re.compile(r"\bRolesAllowedDynamicFeature\b|\bio\.quarkus\.security\b")
+JAXRS_JSR250 = "jaxrs-jsr250"
+# Spring MVC trailing-slash matching switched on explicitly (it is off by default in Spring 6).
+TRAILING_SLASH_ON_RE = re.compile(r"\b(?:setUseTrailingSlashMatch|useTrailingSlashMatch)\s*\(\s*true\b|\bisUseTrailingSlashMatch\s*=\s*true\b")
+# Spring Boot major version in a Maven or Gradle build file.
+BOOT_VERSION_RE = re.compile(
+    r"spring-boot-starter-parent</artifactId>\s*<version>\s*(\d+)\."
+    r"|spring-boot-dependencies</artifactId>\s*<version>\s*(\d+)\."
+    r"|<spring-boot\.version>\s*(\d+)\."
+    r"|org\.springframework\.boot[\"']?\)?\s+version\s+[\"'](\d+)\."
+    r"|spring-boot-gradle-plugin:(\d+)\."
+    r"|springBootVersion\s*=\s*[\"'](\d+)\."
 )
 # Route kinds Spring Security's filter chain sits in front of. Micronaut, Ktor
 # and Javalin routes have their own security and are left alone.
@@ -141,11 +164,13 @@ MODULE_BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts")
 # Directory names whose security configs are test-only and never guard a route.
 _TEST_DIR_NAMES = frozenset({"test", "tests", "testfixtures", "integrationtest", "it", "e2e"})
 _ANNOTATION_TEXT_CHARS = 120
+_DECISION_RANK = {None: 0, ANONYMOUS: 0, UNKNOWN: 1, REQUIRED: 2}
 
 
 @dataclass
 class MethodSecurity:
-    decision: str  # REQUIRED or ANONYMOUS
+    family: str  # PREPOST / SECURED / JSR250
+    decision: str  # REQUIRED / ANONYMOUS / UNKNOWN
     guard: str
     evidence: str
 
@@ -153,7 +178,21 @@ class MethodSecurity:
 @dataclass
 class RouteMeta:
     kind: str  # spring / jaxrs / functional / micronaut / ktor / javalin
-    method_security: MethodSecurity | None = None
+    # One (method-level, class-level) annotation pair per handler mapped to this
+    # route key; several when `params=` / `headers=` variants share a path+method.
+    method_security: list[tuple[list[MethodSecurity], list[MethodSecurity]]] = field(default_factory=list)
+
+
+@dataclass
+class RepoSecurity:
+    """Security facts gathered while walking the repo, applied at the end."""
+
+    files: dict[str, FileSecurity] = field(default_factory=dict)
+    # File -> method-security switches it turns on (PREPOST / SECURED / JSR250 / JAXRS_JSR250).
+    switches: dict[str, set[str]] = field(default_factory=dict)
+    # Files importing `jakarta.servlet` (Spring 6: no trailing-slash matching by default).
+    jakarta_files: set[str] = field(default_factory=set)
+    trailing_slash_on: bool = False
 
 
 def _is_test_path(relative: str) -> bool:
@@ -165,29 +204,86 @@ def _annotation_text(annotation: Annotation) -> str:
     return text if len(text) <= _ANNOTATION_TEXT_CHARS else text[: _ANNOTATION_TEXT_CHARS - 1] + "…"
 
 
-def _method_security(block: AnnotationBlock | None, relative: str, content: str) -> MethodSecurity | None:
-    """Auth a method-security annotation in ``block`` declares, if any.
+def _method_security(block: AnnotationBlock | None, relative: str, content: str) -> list[MethodSecurity]:
+    """Method-security annotations in ``block`` with the access each declares.
 
-    `@PermitAll`, `@PreAuthorize("permitAll()")` and `@Secured("IS_AUTHENTICATED_ANONYMOUSLY")`
-    open the method; every other method-security annotation requires an
-    authenticated caller.
+    `@PreAuthorize` SpEL is read like `access(...)`: an `or` branch, `isAnonymous()`,
+    `permitAll` or an ANONYMOUS authority means anonymous callers may get in.
+    `@Secured` / `@RolesAllowed` naming an ANONYMOUS authority, and `@PermitAll`,
+    open the method; `@DenyAll` and other roles require an authenticated caller.
     """
+    found: list[MethodSecurity] = []
     if block is None:
-        return None
+        return found
     for annotation in block.annotations:
-        if annotation.name not in METHOD_SECURITY_ANNOTATIONS:
+        family = METHOD_SECURITY_FAMILIES.get(annotation.name)
+        if family is None:
             continue
         args = annotation.args or ""
-        if annotation.name == "PermitAll" or (
-            annotation.name in {"PreAuthorize", "Secured"}
-            and _METHOD_SECURITY_PERMIT_RE.search(args)
-            and not _METHOD_SECURITY_REQUIRED_RE.search(args)
-        ):
-            decision = ANONYMOUS
-        else:
+        if annotation.name == "PreAuthorize":
+            decision = spel_decision(args) if args.strip() else UNKNOWN
+        elif annotation.name in ("Secured", "RolesAllowed"):
+            if not args.strip():
+                decision = UNKNOWN
+            else:
+                decision = ANONYMOUS if ANONYMOUS_AUTHORITY_RE.search(args) else REQUIRED
+        elif annotation.name == "DenyAll":
             decision = REQUIRED
+        else:
+            decision = ANONYMOUS
         text = _annotation_text(annotation)
-        return MethodSecurity(decision, text, f"{relative}:{line_of(content, annotation.start)} {text}")
+        found.append(MethodSecurity(family, decision, text, f"{relative}:{line_of(content, annotation.start)} {text}"))
+    return found
+
+
+def _method_security_switches(content: str) -> set[str]:
+    """Method-security families a file switches on (`@EnableMethodSecurity` & co.)."""
+    switches: set[str] = set()
+    if "MethodSecurity" not in content and "RolesAllowedDynamicFeature" not in content and "io.quarkus" not in content:
+        return switches
+    masked = mask_comments(content)
+    for annotation in find_annotations(masked, ENABLE_METHOD_SECURITY):
+        named = {k: v.strip() for k, v in annotation.named.items()}
+        if annotation.name == "EnableMethodSecurity":
+            if named.get("prePostEnabled") != "false":
+                switches.add(PREPOST)
+        elif annotation.name == "EnableReactiveMethodSecurity":
+            switches.add(PREPOST)
+        elif named.get("prePostEnabled") == "true":
+            switches.add(PREPOST)
+        if named.get("securedEnabled") == "true":
+            switches.add(SECURED)
+        if named.get("jsr250Enabled") == "true":
+            switches.add(JSR250)
+    if JAXRS_ROLES_RE.search(masked):
+        switches.add(JAXRS_JSR250)
+    return switches
+
+
+def _effective_method_security(
+    levels: tuple[list[MethodSecurity], list[MethodSecurity]], switches: set[str], kind: str
+) -> MethodSecurity | None:
+    """What the method security that is switched on does for one handler.
+
+    Each enabled family looks at the method first, then the class. Every
+    enabled interceptor runs, so one that requires authentication guards the
+    handler; annotations whose family isn't switched on do nothing.
+    """
+    method_level, class_level = levels
+    picks: list[MethodSecurity] = []
+    for family in (PREPOST, SECURED, JSR250):
+        enabled = family in switches or (family == JSR250 and kind == "jaxrs" and JAXRS_JSR250 in switches)
+        if not enabled:
+            continue
+        pick = next((m for m in method_level if m.family == family), None) or next(
+            (m for m in class_level if m.family == family), None
+        )
+        if pick is not None:
+            picks.append(pick)
+    for decision in (REQUIRED, UNKNOWN, ANONYMOUS):
+        for pick in picks:
+            if pick.decision == decision:
+                return pick
     return None
 
 
@@ -462,7 +558,7 @@ class JavaSpringAnalyzer:
             self._append_unique_service(result, f"spring_app:{spring_app}", "application.properties")
 
         route_meta: dict[tuple[str, str, str], RouteMeta] = {}
-        security: dict[str, FileSecurity] = {}
+        security = RepoSecurity()
         for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
             content = read_source(file_path, root=root)
             if content is None:
@@ -520,65 +616,109 @@ class JavaSpringAnalyzer:
                     result, route.path, route.method, relative, line_of(content, route.offset), meta, RouteMeta("functional")
                 )
 
-    def _extract_security_rules(self, content: str, relative: str, security: dict[str, FileSecurity]) -> None:
-        """Spring Security authorization rules in ``content`` (#3).
+    def _extract_security_rules(self, content: str, relative: str, security: RepoSecurity) -> None:
+        """Spring Security authorization rules and switches in ``content`` (#3).
 
         Test configurations (`src/test/...`) never guard a deployed route.
         """
-        if _is_test_path(relative) or not SECURITY_GATE_RE.search(content):
+        if _is_test_path(relative):
+            return
+        if "jakarta.servlet" in content:
+            security.jakarta_files.add(relative)
+        if not security.trailing_slash_on and TRAILING_SLASH_ON_RE.search(content):
+            security.trailing_slash_on = True
+        switches = _method_security_switches(content)
+        if switches:
+            security.switches[relative] = switches
+        if not SECURITY_GATE_RE.search(content):
             return
         parsed = parse_security(mask_comments(content), relative)
         if parsed.chains or parsed.ignored:
-            security[relative] = parsed
+            security.files[relative] = parsed
 
     def _apply_route_auth(
         self,
         root: Path,
         result: ScanResult,
         route_meta: dict[tuple[str, str, str], RouteMeta],
-        security: dict[str, FileSecurity],
+        security: RepoSecurity,
     ) -> None:
         """Set `Route.auth` from filter-chain rules and method security.
 
         A chain applies to routes in its own build module (nearest `pom.xml` /
         `build.gradle`); a module with routes but no chain of its own uses the
-        chains of route-less modules (a shared security library). Method security
-        can only narrow access: it turns an `anonymous` chain decision into
-        `required`, and `@PermitAll` never opens a route the chain protects.
+        chains of route-less modules (a shared security library). The same goes
+        for `@EnableMethodSecurity`-style switches: an annotation whose family
+        isn't switched on is ignored. The filter chain runs first, so method
+        security can turn a chain's `anonymous` into `required` but never opens
+        a route the chain protects. Several handlers on one route key (`params=`
+        variants) count only as much as the least restrictive of them.
+
+        Applying rules costs routes x chains x rules x entries, so it shares one
+        `Budget`; once that runs out the remaining routes keep the chain's answer
+        unknown.
         """
         module_cache: dict[str, str] = {}
         chains_by_module: dict[str, list[SecurityChain]] = {}
         ignored_by_module: dict[str, list[Rule]] = {}
-        for relative, parsed in security.items():
+        for relative, parsed in security.files.items():
             module = _module_of(root, relative, module_cache)
             chains_by_module.setdefault(module, []).extend(parsed.chains)
             ignored_by_module.setdefault(module, []).extend(parsed.ignored)
+        switches_by_module: dict[str, set[str]] = {}
+        for relative, switches in security.switches.items():
+            switches_by_module.setdefault(_module_of(root, relative, module_cache), set()).update(switches)
+        jakarta_modules = {_module_of(root, relative, module_cache) for relative in security.jakarta_files}
         route_modules = {_module_of(root, r.file, module_cache) for r in result.routes}
         shared = [m for m in chains_by_module if m not in route_modules]
+        shared_switches: set[str] = set()
+        for module, switches in switches_by_module.items():
+            if module not in route_modules:
+                shared_switches |= switches
+        spring6_cache: dict[str, bool] = {}
+        budget = Budget()
 
         for route in result.routes:
             meta = route_meta.get((route.path, route.method, route.file))
             if meta is None:
                 continue
+            module = _module_of(root, route.file, module_cache)
             chain_result: Resolution | None = None
-            if meta.kind in FILTER_CHAIN_KINDS and chains_by_module:
-                module = _module_of(root, route.file, module_cache)
+            if meta.kind in FILTER_CHAIN_KINDS and chains_by_module and not budget.exhausted:
                 modules = [module] if module in chains_by_module else shared
                 chains = [c for m in modules for c in chains_by_module[m]]
                 ignored = [r for m in modules for r in ignored_by_module.get(m, [])]
                 route_dir = route.file.rsplit("/", 1)[0] if "/" in route.file else ""
-                chain_result = resolve_route(chains, ignored, route.path, route.method, route_dir)
-            method_security = meta.method_security
-            method_required = method_security is not None and method_security.decision == REQUIRED
+                # Spring 6 / Boot 3 no longer routes `/x/` to `/x`; JAX-RS runtimes do.
+                trailing = (
+                    meta.kind == "jaxrs"
+                    or security.trailing_slash_on
+                    or not (module in jakarta_modules or _is_spring6_module(root, module, spring6_cache))
+                )
+                try:
+                    chain_result = resolve_route(
+                        chains, ignored, route.path, route.method, route_dir,
+                        trailing_slash_reaches_handler=trailing, budget=budget,
+                    )
+                except BudgetExceeded:
+                    chain_result = None
+            switches = switches_by_module.get(module, set()) | shared_switches
+            method_security: MethodSecurity | None = None
+            if meta.kind in FILTER_CHAIN_KINDS and meta.method_security:
+                effective = [_effective_method_security(levels, switches, meta.kind) for levels in meta.method_security]
+                # The least restrictive handler decides.
+                method_security = min(effective, key=lambda m: _DECISION_RANK[m.decision if m else None])
+            method_decision = method_security.decision if method_security is not None else None
             if chain_result is not None and chain_result.decision == REQUIRED:
                 route.auth = "required"
-                route.guards = [*chain_result.guards, *([method_security.guard] if method_required else [])]
+                extra = [method_security.guard] if method_security is not None and method_decision == REQUIRED else []
+                route.guards = [*chain_result.guards, *extra]
                 route.guard_evidence = chain_result.evidence
-            elif method_required:
+            elif method_security is not None and method_decision == REQUIRED:
                 route.auth = "required"
                 route.guards = [method_security.guard]
                 route.guard_evidence = method_security.evidence
-            elif chain_result is not None and chain_result.decision == ANONYMOUS:
+            elif chain_result is not None and chain_result.decision == ANONYMOUS and method_decision in (None, ANONYMOUS):
                 route.auth = "anonymous"
                 route.guards = []
                 route.guard_evidence = chain_result.evidence
@@ -624,13 +764,14 @@ class JavaSpringAnalyzer:
                 continue
             scope = innermost_scope(scopes, block.annotations[0].start)
             prefixes = class_paths.get(scope.keyword_at, [""]) if scope is not None else [""]
-            # Method-level security overrides class-level security.
-            security = _method_security(block, relative, content) or (
-                _method_security(class_blocks.get(scope.keyword_at), relative, content) if scope is not None else None
+            # Method-level annotations, then the class's (each family looks at both).
+            levels = (
+                _method_security(block, relative, content),
+                _method_security(class_blocks.get(scope.keyword_at), relative, content) if scope is not None else [],
             )
             for annotation, method, paths, kind in members:
                 line = line_of(content, annotation.start)
-                route_meta = RouteMeta(kind, security if kind in FILTER_CHAIN_KINDS else None)
+                route_meta = RouteMeta(kind, [levels])
                 for prefix in prefixes:
                     for suffix in paths:
                         self._append_unique_route(
@@ -731,6 +872,10 @@ class JavaSpringAnalyzer:
     ) -> None:
         key = (path, method, file)
         if route_meta is not None and key in route_meta:
+            # Another handler on the same path+method (`params=` / `headers=`
+            # variants): keep its method security too, so the least restrictive wins.
+            if meta is not None:
+                route_meta[key].method_security.extend(meta.method_security)
             return
         if any((item.path, item.method, item.file) == key for item in result.routes):
             return
@@ -786,6 +931,32 @@ class JavaSpringAnalyzer:
         if any((item.hint, item.file) == key for item in result.service_hints):
             return
         result.service_hints.append(ServiceHint(hint=hint, file=file))
+
+
+def _is_spring6_module(root: Path, module: str, cache: dict[str, bool]) -> bool:
+    """True when the module's (or an enclosing) build file pins Spring Boot 3+."""
+    if module in cache:
+        return cache[module]
+    found = False
+    directory = module
+    for _ in range(64):
+        base = root / directory if directory else root
+        for name in MODULE_BUILD_FILES:
+            text = read_source(base / name, root=root) if (base / name).is_file() else None
+            if text is None:
+                continue
+            for match in BOOT_VERSION_RE.finditer(text):
+                version = next((g for g in match.groups() if g), None)
+                if version is not None and int(version) >= 3:
+                    found = True
+                    break
+            if found:
+                break
+        if found or not directory:
+            break
+        directory = directory.rsplit("/", 1)[0] if "/" in directory else ""
+    cache[module] = found
+    return found
 
 
 def _module_of(root: Path, relative: str, cache: dict[str, str]) -> str:

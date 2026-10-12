@@ -217,7 +217,16 @@ def test_functional_routes_reader_never_raises_on_garbage() -> None:
         ("/favicon.*", "/favicon.ico", FULL),
         ("/favicon.ico", "/*.lesson", NONE),
         ("/files/{*rest}", "/files/a/b", FULL),
-        ("api/**", "/api/x", FULL),
+        # A multi-segment route wildcard is only covered by a pattern `**`.
+        ("/files/*", "/files/**", PARTIAL),
+        ("/files/{name}", "/files/{*rest}", PARTIAL),
+        ("/files/**", "/files/**", FULL),
+        ("/files/**", "/files/{*rest}", FULL),
+        ("/files", "/files/**", PARTIAL),
+        ("/other/*", "/files/**", NONE),
+        # A pattern with a trailing slash never matches a path without one.
+        ("/admin/", "/admin", NONE),
+        ("/admin/", "/admin/", FULL),
         ("/**", "/", FULL),
         ("/a?c", "/abc", FULL),
     ],
@@ -238,13 +247,19 @@ def test_match_path_is_bounded_on_hostile_patterns() -> None:
 
 
 def test_read_matcher_args_forms() -> None:
-    m = read_matcher_args('HttpMethod.POST, "/a", "b"')
-    assert m.entries == [("POST", "/a"), ("POST", "/b")] and not m.opaque
-    assert read_matcher_args("HttpMethod.OPTIONS").entries == [("OPTIONS", None)]
-    assert read_matcher_args('antMatcher("/h2/**"), mvc.pattern("/x")').entries == [(None, "/h2/**"), (None, "/x")]
-    assert read_matcher_args('new AntPathRequestMatcher("/x", "DELETE")').entries == [("DELETE", "/x")]
+    m = read_matcher_args('HttpMethod.POST, "/a", "/b"')
+    assert m.entries == [("POST", "/a", False), ("POST", "/b", False)] and not m.opaque
+    assert read_matcher_args("HttpMethod.OPTIONS").entries == [("OPTIONS", None, True)]
+    # Ant matchers don't cover `/x/` for `/x`; MVC-mirroring `mvc.pattern` does.
+    assert read_matcher_args('antMatcher("/h2/**"), mvc.pattern("/x")').entries == [
+        (None, "/h2/**", False),
+        (None, "/x", True),
+    ]
+    assert read_matcher_args('new AntPathRequestMatcher("/x", "DELETE")').entries == [("DELETE", "/x", False)]
+    # Ant never matches a pattern without a leading slash; other matchers may.
+    assert read_matcher_args('"admin/**"').opaque
     assert read_matcher_args("url").opaque
-    assert read_matcher_args("PathRequest.toStaticResources().atCommonLocations()").entries[0] == (None, "/css/**")
+    assert read_matcher_args("PathRequest.toStaticResources().atCommonLocations()").entries[0][:2] == (None, "/css/**")
 
 
 @pytest.mark.parametrize(
@@ -253,6 +268,17 @@ def test_read_matcher_args_forms() -> None:
         ('access("hasRole(\'ADMIN\')")', "required"),
         ('access("permitAll")', "anonymous"),
         ('access("isAnonymous() or isAuthenticated()")', "unknown"),
+        ('access("hasRole(\'A\') or hasIpAddress(\'10.0.0.1\')")', "unknown"),
+        ('access("hasRole(\'A\') or permitAll")', "unknown"),
+        ('access("hasRole(\'A\') or hasRole(\'B\')")', "required"),
+        ('access("hasIpAddress(\'10.0.0.1\') and isAuthenticated()")', "required"),
+        ('access("(hasRole(\'A\') or permitAll) and true")', "unknown"),
+        ('access("!isAnonymous()")', "unknown"),
+        ('access("hasAnyRole(\'ANONYMOUS\', \'USER\')")', "anonymous"),
+        ('hasAnyRole("ANONYMOUS", "USER")', "anonymous"),
+        ('hasAuthority("ROLE_ANONYMOUS")', "anonymous"),
+        ("hasAuthority(AuthoritiesConstants.ANONYMOUS)", "anonymous"),
+        ('hasAnyAuthority("ROLE_USER", "ROLE_ADMIN")', "required"),
         ('access("hasIpAddress(\'10.0.0.0/8\')")', "unknown"),
         ('access(new WebExpressionAuthorizationManager("isAuthenticated()"))', "required"),
         ("access(AuthenticatedAuthorizationManager.authenticated())", "required"),
@@ -388,7 +414,9 @@ def test_pre_lambda_authorize_requests_chain(tmp_path: Path) -> None:
     ))
     result = JavaSpringAnalyzer().analyze(tmp_path)
     auth = _auth(result)
-    assert auth[("GET", "/articles/feed")] == "required"
+    # Spring Boot 2 routes `GET /articles/feed/` to the same handler, the Ant
+    # pattern `/articles/feed` doesn't match it, and `/articles/**` permits it.
+    assert auth[("GET", "/articles/feed")] == "unknown"
     # `/articles/feed` is one value of {slug}; the rest of the route is public.
     assert auth[("GET", "/articles/{slug}")] == "anonymous"
     assert auth[("PUT", "/articles/{slug}")] == "required"
@@ -599,6 +627,7 @@ def test_method_security_combines_with_chain(tmp_path: Path) -> None:
         '}\n'
     ))
     _write(tmp_path, "Sec.java", (
+        '@EnableMethodSecurity\n'
         'class Sec {\n'
         '    SecurityFilterChain chain(HttpSecurity http) {\n'
         '        return http.authorizeHttpRequests(a -> a\n'
@@ -628,6 +657,11 @@ def test_method_security_without_filter_chain(tmp_path: Path) -> None:
         '    @POST @PermitAll\n'
         '    public void create() {}\n'
         '}\n'
+    ))
+    # Without Jersey's RolesAllowedDynamicFeature (or jsr250Enabled) @RolesAllowed does nothing.
+    assert JavaSpringAnalyzer().analyze(tmp_path).routes[0].auth == "unknown"
+    _write(tmp_path, "App.java", (
+        'class App extends ResourceConfig { App() { register(RolesAllowedDynamicFeature.class); } }\n'
     ))
     result = JavaSpringAnalyzer().analyze(tmp_path)
     assert _route(result, "DELETE", "/orders/{id}").guards == ['@RolesAllowed("admin")']
@@ -844,3 +878,224 @@ def test_jaxrs_multi_class_file_does_not_borrow_neighbouring_paths(tmp_path: Pat
         ("GET", "/orders/recent"),
         ("DELETE", "/orders"),
     }
+
+
+# ---------- Review hardening: never `required` when Spring lets a request through ----------
+
+_BOOT3_POM = (
+    "<project><parent><groupId>org.springframework.boot</groupId>"
+    "<artifactId>spring-boot-starter-parent</artifactId><version>3.2.5</version></parent></project>"
+)
+_BOOT2_POM = _BOOT3_POM.replace("3.2.5", "2.7.18")
+
+
+def _sec(rules: str, *, extra: str = "") -> str:
+    return (
+        f"{extra}class Sec {{ SecurityFilterChain c(HttpSecurity http) {{\n"
+        f"    return http.authorizeHttpRequests(a -> a{rules}).build(); }} }}\n"
+    )
+
+
+def test_route_multi_segment_wildcard_is_not_covered_by_a_narrower_pattern(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "Files.java", (
+        '@RestController class Files {\n'
+        '    @GetMapping("/files/**") Object all() { return null; }\n'
+        '    @PostMapping("/blobs/{*path}") Object blob() { return null; }\n'
+        '    @DeleteMapping("/docs/**") Object docs() { return null; }\n'
+        '}\n'
+    ))
+    _write(tmp_path, "Sec.java", _sec(
+        '.requestMatchers("/files/*").authenticated()'
+        '.requestMatchers("/blobs/{name}").authenticated()'
+        '.requestMatchers("/docs/**").authenticated()'
+        '.anyRequest().permitAll()'
+    ))
+    auth = _auth(JavaSpringAnalyzer().analyze(tmp_path))
+    # `/files/a/b` and `/blobs/a/b` fall through to permitAll.
+    assert auth[("GET", "/files/**")] == "anonymous"
+    assert auth[("POST", "/blobs/{*path}")] == "anonymous"
+    assert auth[("DELETE", "/docs/**")] == "required"
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        ("boot2", "unknown"),  # POST /admin/ reaches the handler and is permitted
+        ("none", "unknown"),  # version unknown: assume Boot 2 behaviour
+        ("boot3", "required"),  # Spring 6 doesn't route /admin/ to /admin
+        ("jakarta", "required"),  # jakarta.servlet means Spring 6
+        ("boot3-trailing-on", "unknown"),  # trailing-slash matching switched back on
+    ],
+)
+def test_trailing_slash_bypass_of_an_exact_ant_pattern(tmp_path: Path, setup: str, expected: str) -> None:
+    if setup.startswith("boot3"):
+        _write(tmp_path, "pom.xml", _BOOT3_POM)
+    elif setup == "boot2":
+        _write(tmp_path, "pom.xml", _BOOT2_POM)
+    imports = "import jakarta.servlet.http.HttpServletRequest;\n" if setup == "jakarta" else ""
+    _write(tmp_path, "Admin.java", imports + '@RestController class Admin { @PostMapping("/admin") Object a() { return null; } }\n')
+    if setup == "boot3-trailing-on":
+        _write(tmp_path, "Web.java", "class Web { void c(PathMatchConfigurer c) { c.setUseTrailingSlashMatch(true); } }\n")
+    _write(tmp_path, "Sec.java", (
+        "class Sec { protected void configure(HttpSecurity http) {\n"
+        '    http.authorizeRequests().antMatchers("/admin").hasRole("A").anyRequest().permitAll(); } }\n'
+    ))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin").auth == expected
+
+
+def test_trailing_slash_safe_matchers_stay_required_on_boot2(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT2_POM)
+    _write(tmp_path, "Admin.java", (
+        '@RestController class Admin {\n'
+        '    @PostMapping("/admin") Object a() { return null; }\n'
+        '    @PostMapping("/ops") Object o() { return null; }\n'
+        '    @PostMapping("/slash") Object s() { return null; }\n'
+        '}\n'
+    ))
+    _write(tmp_path, "Sec.java", _sec(
+        '.mvcMatchers("/admin").hasRole("A")'
+        '.requestMatchers("/ops/**").authenticated()'
+        '.requestMatchers("/slash/").authenticated()'
+        '.anyRequest().permitAll()'
+    ))
+    auth = _auth(JavaSpringAnalyzer().analyze(tmp_path))
+    assert auth[("POST", "/admin")] == "required"  # MvcRequestMatcher mirrors MVC's matching
+    assert auth[("POST", "/ops")] == "required"  # `/ops/**` covers `/ops/` too
+    # `/slash/` doesn't cover `/slash`, which is permitted.
+    assert auth[("POST", "/slash")] == "anonymous"
+
+
+def test_trailing_slash_bypass_applies_to_jaxrs_even_on_boot3(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "Res.java", (
+        'import jakarta.ws.rs.*;\n@Path("/admin") public class Res { @POST public void a() {} }\n'
+    ))
+    _write(tmp_path, "Sec.java", _sec('.requestMatchers("/admin").hasRole("A").anyRequest().permitAll()'))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin").auth == "unknown"
+
+
+def test_head_reaches_a_get_handler_that_a_get_only_rule_protects(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "R.java", (
+        '@RestController class R {\n'
+        '    @GetMapping("/report") Object r() { return null; }\n'
+        '    @GetMapping("/all") Object a() { return null; }\n'
+        '}\n'
+    ))
+    _write(tmp_path, "Sec.java", _sec(
+        '.requestMatchers(HttpMethod.GET, "/report").authenticated()'
+        '.requestMatchers("/all").authenticated()'
+        '.anyRequest().permitAll()'
+    ))
+    auth = _auth(JavaSpringAnalyzer().analyze(tmp_path))
+    assert auth[("GET", "/report")] == "unknown"
+    assert auth[("GET", "/all")] == "required"
+
+
+def test_method_security_needs_its_switch(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "Api.java", (
+        '@RestController class Api {\n'
+        '    @PreAuthorize("hasRole(\'A\')") @PostMapping("/pre") Object pre() { return null; }\n'
+        '    @Secured("ROLE_A") @PostMapping("/secured") Object secured() { return null; }\n'
+        '    @RolesAllowed("A") @PostMapping("/jsr") Object jsr() { return null; }\n'
+        '}\n'
+    ))
+    rules = '.anyRequest().permitAll()'
+    _write(tmp_path, "Sec.java", _sec(rules))
+    # No @EnableMethodSecurity: the annotations do nothing.
+    assert set(_auth(JavaSpringAnalyzer().analyze(tmp_path)).values()) == {"anonymous"}
+
+    _write(tmp_path, "Sec.java", _sec(rules, extra="@EnableMethodSecurity\n"))
+    auth = _auth(JavaSpringAnalyzer().analyze(tmp_path))
+    # prePostEnabled is on by default; securedEnabled / jsr250Enabled aren't.
+    assert auth == {("POST", "/pre"): "required", ("POST", "/secured"): "anonymous", ("POST", "/jsr"): "anonymous"}
+
+    _write(tmp_path, "Sec.java", _sec(
+        rules, extra="@EnableGlobalMethodSecurity(securedEnabled = true, jsr250Enabled = true)\n"
+    ))
+    auth = _auth(JavaSpringAnalyzer().analyze(tmp_path))
+    # EnableGlobalMethodSecurity needs prePostEnabled = true for @PreAuthorize.
+    assert auth == {("POST", "/pre"): "anonymous", ("POST", "/secured"): "required", ("POST", "/jsr"): "required"}
+
+
+def test_method_security_switch_in_another_app_module_does_not_apply(tmp_path: Path) -> None:
+    for module in ("a", "b"):
+        _write(tmp_path, f"{module}/pom.xml", _BOOT3_POM)
+        _write(tmp_path, f"{module}/src/main/java/Api.java", (
+            '@RestController class Api { @PreAuthorize("hasRole(\'A\')") @PostMapping("/x") Object x() { return null; } }\n'
+        ))
+    _write(tmp_path, "a/src/main/java/Conf.java", "@EnableMethodSecurity class Conf {}\n")
+    by_module = {r.file.split("/")[0]: r.auth for r in JavaSpringAnalyzer().analyze(tmp_path).routes}
+    assert by_module == {"a": "required", "b": "unknown"}
+
+
+def test_annotations_that_admit_anonymous_callers_are_not_guards(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "Api.java", (
+        '@RestController class Api {\n'
+        '    @PostAuthorize("hasRole(\'A\')") @PostMapping("/post") Object post() { return null; }\n'
+        '    @Secured({"ROLE_ANONYMOUS", "ROLE_USER"}) @PostMapping("/anon") Object anon() { return null; }\n'
+        '    @PreAuthorize("isAnonymous() or hasRole(\'A\')") @PostMapping("/either") Object either() { return null; }\n'
+        '    @PreAuthorize("hasRole(\'A\') or hasRole(\'B\')") @PostMapping("/roles") Object roles() { return null; }\n'
+        '}\n'
+    ))
+    _write(tmp_path, "Sec.java", _sec(
+        '.anyRequest().permitAll()',
+        extra="@EnableGlobalMethodSecurity(prePostEnabled = true, securedEnabled = true)\n",
+    ))
+    auth = _auth(JavaSpringAnalyzer().analyze(tmp_path))
+    # @PostAuthorize runs after the handler's side effects; ROLE_ANONYMOUS lets anyone in.
+    assert auth[("POST", "/post")] == "anonymous"
+    assert auth[("POST", "/anon")] == "anonymous"
+    # An `or` with an anonymous branch is unreadable as a guard.
+    assert auth[("POST", "/either")] == "unknown"
+    assert auth[("POST", "/roles")] == "required"
+
+
+def test_handler_variants_on_one_route_key_count_as_the_least_restrictive(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "Api.java", (
+        '@RestController class Api {\n'
+        '    @PreAuthorize("hasRole(\'A\')")\n'
+        '    @PostMapping(value = "/act", params = "admin") Object admin() { return null; }\n'
+        '    @PostMapping(value = "/act", params = "public") Object pub() { return null; }\n'
+        '    @PreAuthorize("hasRole(\'A\')")\n'
+        '    @PostMapping(value = "/both", headers = "X-A") Object b1() { return null; }\n'
+        '    @PreAuthorize("hasRole(\'B\')")\n'
+        '    @PostMapping(value = "/both", headers = "X-B") Object b2() { return null; }\n'
+        '}\n'
+    ))
+    _write(tmp_path, "Sec.java", _sec('.anyRequest().permitAll()', extra="@EnableMethodSecurity\n"))
+    auth = _auth(JavaSpringAnalyzer().analyze(tmp_path))
+    assert auth[("POST", "/act")] == "anonymous"
+    assert auth[("POST", "/both")] == "required"
+
+
+def test_resolution_budget_degrades_to_unknown() -> None:
+    from attackmap_analyzer_java_spring.security_dsl import Budget, BudgetExceeded, resolve_route
+
+    found = parse_security(_sec('.requestMatchers("/a", "/b", "/c").permitAll().anyRequest().authenticated()'), "S.java")
+    assert resolve_route(found.chains, [], "/x", "POST", "", budget=Budget(1000)).decision == "required"
+    with pytest.raises(BudgetExceeded):
+        resolve_route(found.chains, [], "/x", "POST", "", budget=Budget(2))
+
+
+def test_hostile_configs_across_files_stay_fast(tmp_path: Path) -> None:
+    import time
+
+    patterns = ", ".join(f'"/p{i}/**/x/*/{{v}}/**/y"' for i in range(200))
+    rule = f".requestMatchers({patterns}).hasRole(\"A\")"
+    for n in range(4):
+        _write(tmp_path, f"conf{n}/Sec{n}.java", _sec(rule * 300 + ".anyRequest().authenticated()"))
+    routes = "".join(f'    @PostMapping("/r{i}/a/b/c/{{id}}") Object r{i}() {{ return null; }}\n' for i in range(150))
+    _write(tmp_path, "Api.java", "@RestController class Api {\n" + routes + "}\n")
+    start = time.perf_counter()
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    elapsed = time.perf_counter() - start
+    assert len(result.routes) == 150
+    assert elapsed < 30, elapsed
+    # The budget ran out part-way: no route got a wrong answer, most stayed unknown.
+    assert set(_auth(result).values()) <= {"required", "unknown"}
+    assert "unknown" in set(_auth(result).values())
