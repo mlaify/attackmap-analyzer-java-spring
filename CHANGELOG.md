@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Same-repo `static final String` / Kotlin `const val` constants resolve in
+  matcher patterns, authority arguments, `access(..)`, `@PreAuthorize` (including
+  `+` concatenation of literals and constants), `@Secured` and `@RolesAllowed`
+  ([#11](https://github.com/mlaify/attackmap-analyzer-java-spring/issues/11)).
+  Unresolved or ambiguous references stay `unknown`.
 - Spring WebFlux / WebMvc.fn functional endpoints become routes
   ([#3](https://github.com/mlaify/attackmap-analyzer-java-spring/issues/3)):
   `RouterFunctions.route(GET("/x"), h).andRoute(...)`, `nest(path("/api"), ...)` /
