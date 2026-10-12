@@ -62,10 +62,15 @@ MAX_PATTERN_CHARS = 512
 MAX_SEGMENTS = 32
 MAX_SEGMENT_CHARS = 128
 MAX_DOUBLE_WILDCARDS = 4
-# Matcher-entry evaluations per repo when applying rules to routes. Cost grows
-# as routes x chains x rules x entries, so a hostile repo (several large config
-# files, many routes) is cut off here and its remaining routes stay unknown.
-MAX_MATCH_EVALUATIONS = 200_000
+# Work allowed per repo when applying rules to routes, in cost units: each
+# matcher entry costs ENTRY_COST, each path match the size of its segment table,
+# each glob comparison pattern x text characters. Cost grows as routes x chains
+# x rules x entries x pattern size, so a hostile repo (large config files, long
+# glob patterns, many routes) is cut off here and its remaining routes stay unknown.
+MAX_MATCH_COST = 5_000_000
+ENTRY_COST = 20
+# Wildcards (`*`, `?`, `{..}`) in one pattern segment; more is unreadable.
+MAX_SEGMENT_WILDCARDS = 8
 _EVIDENCE_CHARS = 160
 
 HTTP_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"})
@@ -109,7 +114,18 @@ _ACCESS_PERMIT_RE = re.compile(r"\b(?:permitAll|isAnonymous|anonymous)\b")
 ANONYMOUS_AUTHORITY_RE = re.compile(r"ANONYMOUS")
 _SPEL_OR_RE = re.compile(r"\bor\b|\|\|")
 _SPEL_AND_RE = re.compile(r"\band\b|&&")
-_SPEL_NOT_RE = re.compile(r"\bnot\b|!")
+# One SpEL term we can read: a bare name or a call whose arguments are all
+# string literals (`hasRole('A')`, `isAuthenticated()`, `permitAll`). Anything
+# else (`==`, `!`, `not`, ternaries, `#param`, `@bean`, grouping) is unreadable.
+_SPEL_LITERAL = r"""(?:'[^'\\\n]*'|"[^"\\\n]*")"""
+_SPEL_TERM_RE = re.compile(
+    r"\s*([A-Za-z_]\w*)\s*(?:\(\s*(" + _SPEL_LITERAL + r"(?:\s*,\s*" + _SPEL_LITERAL + r")*)?\s*\))?\s*"
+)
+_SPEL_PERMIT_NAMES = frozenset({"permitAll", "isAnonymous", "anonymous"})
+_SPEL_REQUIRED_NAMES = frozenset(
+    {"isAuthenticated", "isFullyAuthenticated", "authenticated", "fullyAuthenticated", "denyAll", "isRememberMe"}
+)
+_SPEL_ROLE_NAMES = frozenset({"hasRole", "hasAnyRole", "hasAuthority", "hasAnyAuthority"})
 # `access(...)` arguments we can read: a SpEL string (Spring Security 5), the
 # same wrapped in a WebExpressionAuthorizationManager, or a stock manager call.
 _SPEL_ARG_RE = re.compile(r'(?:new\s+WebExpressionAuthorizationManager\s*\(\s*)?"((?:[^"\\\n]|\\.)*)"\s*\)?')
@@ -149,10 +165,10 @@ class Entry(NamedTuple):
 
 
 class Budget:
-    """A per-repo allowance of matcher-entry evaluations."""
+    """A per-repo allowance of matching work (see MAX_MATCH_COST)."""
 
-    def __init__(self, evaluations: int = MAX_MATCH_EVALUATIONS) -> None:
-        self.remaining = evaluations
+    def __init__(self, cost: int = MAX_MATCH_COST) -> None:
+        self.remaining = cost
 
     @property
     def exhausted(self) -> bool:
@@ -186,9 +202,11 @@ class Matcher:
         kinds: set[str] = set()
         for entry_method, pattern, slash_safe in self.entries:
             if budget is not None:
-                budget.spend()
+                budget.spend(ENTRY_COST)
             path_result = (
-                FULL if pattern is None else match_path(pattern, path, trailing=trailing, slash_safe=slash_safe)
+                FULL
+                if pattern is None
+                else match_path(pattern, path, trailing=trailing, slash_safe=slash_safe, budget=budget)
             )
             if path_result == NONE:
                 continue
@@ -250,11 +268,13 @@ def _is_variable(seg: str) -> bool:
     return "{" in seg or "*" in seg
 
 
-def _glob_match(pattern: str, text: str) -> bool:
+def _glob_match(pattern: str, text: str, budget: Budget | None = None) -> bool:
     """`*`/`?` wildcard match of one segment (`{var}` already turned into `*`).
 
     Dynamic programming, O(len(pattern) * len(text)); no regex backtracking.
     """
+    if budget is not None:
+        budget.spend(len(pattern) * (len(text) + 1))
     prev = [False] * (len(text) + 1)
     prev[0] = True
     for p in pattern:
@@ -291,7 +311,7 @@ def _template_to_glob(seg: str) -> tuple[str, bool]:
     return "".join(out), had_regex
 
 
-def _match_segment(pattern_seg: str, route_seg: str) -> int:
+def _match_segment(pattern_seg: str, route_seg: str, budget: Budget | None = None) -> int:
     if pattern_seg == "*":
         return FULL
     if pattern_seg.startswith("{") and pattern_seg.endswith("}") and pattern_seg.count("{") == 1:
@@ -304,16 +324,18 @@ def _match_segment(pattern_seg: str, route_seg: str) -> int:
         # Some values of the route variable equal the literal, unless the
         # route segment's own literal parts rule it out (`*.lesson` vs `favicon.ico`).
         route_glob, _ = _template_to_glob(route_seg)
-        return PARTIAL if _glob_match(route_glob, pattern_seg) else NONE
+        return PARTIAL if _glob_match(route_glob, pattern_seg, budget) else NONE
     if not is_glob:
         return FULL if pattern_seg == route_seg else NONE
     glob, had_regex = _template_to_glob(pattern_seg)
-    if not _glob_match(glob, route_seg):
+    if not _glob_match(glob, route_seg, budget):
         return NONE
     return PARTIAL if had_regex else FULL
 
 
-def match_path(pattern: str, path: str, *, trailing: bool = False, slash_safe: bool = False) -> int:
+def match_path(
+    pattern: str, path: str, *, trailing: bool = False, slash_safe: bool = False, budget: Budget | None = None
+) -> int:
     """Match an Ant/PathPattern ``pattern`` against a route path template.
 
     FULL when every request to the route matches, PARTIAL when some might,
@@ -333,8 +355,15 @@ def match_path(pattern: str, path: str, *, trailing: bool = False, slash_safe: b
         return PARTIAL
     psegs = _segments(pattern)
     rsegs = _segments(path)
-    if psegs is None or rsegs is None or sum(_is_multi(s) for s in psegs) > MAX_DOUBLE_WILDCARDS:
+    if (
+        psegs is None
+        or rsegs is None
+        or sum(_is_multi(s) for s in psegs) > MAX_DOUBLE_WILDCARDS
+        or any(sum(s.count(c) for c in "*?{") > MAX_SEGMENT_WILDCARDS for s in psegs)
+    ):
         return PARTIAL
+    if budget is not None:
+        budget.spend((len(psegs) + 1) * (len(rsegs) + 1))
     request_trailing = trailing or (len(path) > 1 and path.endswith("/"))
     pattern_trailing = len(pattern) > 1 and pattern.endswith("/")
     if pattern_trailing and not request_trailing:
@@ -367,7 +396,7 @@ def match_path(pattern: str, path: str, *, trailing: bool = False, slash_safe: b
                 # A narrower pattern covers only some expansions of `**`.
                 result = PARTIAL
             else:
-                seg = _match_segment(p, rsegs[j])
+                seg = _match_segment(p, rsegs[j], budget)
                 result = NONE if seg == NONE else min(seg, walk(i + 1, j + 1))
         memo[key] = result
         return result
@@ -466,12 +495,29 @@ def _read_wrapper(name: str, args: str, depth: int) -> Matcher:
 _ROLE_DECISIONS = frozenset({"hasRole", "hasAnyRole", "hasAuthority", "hasAnyAuthority"})
 
 
+def literal_args(args: str) -> list[str] | None:
+    """The string-literal arguments of a call, or None if any argument isn't one
+    (a constant such as `AuthoritiesConstants.ADMIN`, a concatenation)."""
+    parts = split_top_level(args)
+    values = [_string_literal(part) for part in parts]
+    if not parts or any(v is None for v in values):
+        return None
+    return [v for v in values if v is not None]
+
+
+def _role_decision(args: str | None) -> str:
+    """`hasRole(..)`-style arguments: literal roles only; anonymous ones let anyone in."""
+    roles = literal_args(args or "")
+    if roles is None:
+        return UNKNOWN
+    return ANONYMOUS if any(ANONYMOUS_AUTHORITY_RE.search(r) for r in roles) else REQUIRED
+
+
 def _decision(name: str, args: str | None) -> str:
     if name in _ANON_DECISIONS:
         return ANONYMOUS
     if name in _ROLE_DECISIONS:
-        # Anonymous users hold ROLE_ANONYMOUS, so `hasAnyRole("ANONYMOUS", ...)` lets them in.
-        return ANONYMOUS if args and ANONYMOUS_AUTHORITY_RE.search(args) else REQUIRED
+        return _role_decision(args)
     if name in _REQUIRED_DECISIONS:
         return REQUIRED
     if name == "access" and args is not None:
@@ -479,47 +525,42 @@ def _decision(name: str, args: str | None) -> str:
         spel = _SPEL_ARG_RE.fullmatch(args)
         if spel is not None:
             return spel_decision(spel.group(1))
-        if _MANAGER_ARG_RE.fullmatch(args):
-            return ANONYMOUS if ANONYMOUS_AUTHORITY_RE.search(args) else REQUIRED
+        manager = _MANAGER_ARG_RE.fullmatch(args)
+        if manager is not None:
+            inner = args[args.index("(") + 1 : args.rindex(")")]
+            return _role_decision(inner) if inner.strip() else REQUIRED
     return UNKNOWN
-
-
-def _has_grouping_parens(expr: str) -> bool:
-    """`(a or b) and c`: a parenthesis that isn't a call's argument list."""
-    previous = ""
-    for c in expr:
-        if c == "(" and not (previous.isalnum() or previous in "_$"):
-            return True
-        if not c.isspace():
-            previous = c
-    return False
 
 
 def spel_decision(expr: str) -> str:
     """Decision of a Spring Security SpEL expression (`access("...")`, `@PreAuthorize`).
 
-    REQUIRED only when every `or` branch requires an authenticated, non-anonymous
-    caller; ANONYMOUS for a single branch that only permits (`permitAll`,
-    `isAnonymous()`, an ANONYMOUS authority); UNKNOWN otherwise, including
-    `not`/`!`, grouping parentheses and conditions such as `hasIpAddress(..)`
-    that aren't authentication.
+    Only plain terms are read (see `_SPEL_TERM_RE`), joined by `and` / `or`.
+    A branch is REQUIRED when one of its `and` terms requires an authenticated,
+    non-anonymous caller; ANONYMOUS when every term only permits (`permitAll`,
+    `isAnonymous()`, an ANONYMOUS authority). The expression is REQUIRED only when
+    every `or` branch is; a single ANONYMOUS branch is ANONYMOUS; anything else,
+    including any operator or argument we can't read, is UNKNOWN.
     """
-    if len(expr) > MAX_CALL_CHARS or _SPEL_NOT_RE.search(expr) or _has_grouping_parens(expr):
+    if len(expr) > MAX_CALL_CHARS:
         return UNKNOWN
-    branches = _SPEL_OR_RE.split(expr)
     results = []
-    for branch in branches:
-        terms = [t for t in _SPEL_AND_RE.split(branch) if t.strip()]
+    for branch in _SPEL_OR_RE.split(expr):
         kinds = set()
-        for term in terms:
-            if ANONYMOUS_AUTHORITY_RE.search(term) or _ACCESS_PERMIT_RE.search(term):
+        for term in _SPEL_AND_RE.split(branch):
+            m = _SPEL_TERM_RE.fullmatch(term)
+            if m is None:
+                return UNKNOWN
+            name, args = m.group(1), m.group(2)
+            if name in _SPEL_PERMIT_NAMES:
                 kinds.add(ANONYMOUS)
-            elif _ACCESS_REQUIRED_RE.search(term):
+            elif name in _SPEL_ROLE_NAMES and args:
+                kinds.add(ANONYMOUS if ANONYMOUS_AUTHORITY_RE.search(args) else REQUIRED)
+            elif name in _SPEL_REQUIRED_NAMES:
                 kinds.add(REQUIRED)
             else:
                 kinds.add(UNKNOWN)
         if REQUIRED in kinds:
-            # `a and isAuthenticated()`: the conjunction needs a logged-in caller.
             results.append(REQUIRED)
         elif kinds == {ANONYMOUS}:
             results.append(ANONYMOUS)
@@ -778,7 +819,10 @@ def _scope_matcher(
             literals = _STRING_LITERAL_RE.findall(args)
             usable = [v for v in literals if v.startswith("/") and "$" not in v]
             scope.entries.extend(Entry(None, p, False) for p in usable[:MAX_ENTRIES_PER_MATCHER])
-            scope.opaque = scope.opaque or not usable or len(usable) != len(literals)
+            # A method (`HttpMethod.POST`) narrows the scope in a way we don't read.
+            scope.opaque = (
+                scope.opaque or not usable or len(usable) != len(literals) or "HttpMethod" in args
+            )
         else:
             inner = read_matcher_args(args)
             scope.entries.extend(inner.entries)
@@ -976,6 +1020,34 @@ def resolve_route(
     """
     if not chains:
         return None
+    resolution = _resolve_form(chains, ignored, path, method, False, route_dir, budget)
+    if resolution is None or resolution.decision != REQUIRED:
+        return resolution
+    variants: list[tuple[str, bool]] = []
+    segments = [s for s in path.split("/") if s]
+    if trailing_slash_reaches_handler and not path.endswith("/") and not (segments and _is_multi(segments[-1])):
+        variants.append((method, True))
+    if method == "GET":
+        variants.append(("HEAD", False))
+    for variant_method, trailing in variants:
+        # Each request form picks its chain afresh: a securityMatcher can match
+        # `POST /x` but not `POST /x/` or `HEAD /x`.
+        other = _resolve_form(chains, ignored, path, variant_method, trailing, route_dir, budget)
+        if other is None or other.decision != REQUIRED:
+            return None
+    return resolution
+
+
+def _resolve_form(
+    chains: list[SecurityChain],
+    ignored: list[Rule],
+    path: str,
+    method: str,
+    trailing: bool,
+    route_dir: str,
+    budget: Budget | None,
+) -> Resolution | None:
+    """Chain selection and decision for one request form of a route."""
     full: list[SecurityChain] = []
     partial: list[SecurityChain] = []
     catch_all: list[SecurityChain] = []
@@ -983,7 +1055,7 @@ def resolve_route(
         if chain.scope is None:
             catch_all.append(chain)
             continue
-        result = chain.scope.match(path, method, budget=budget)
+        result = chain.scope.match(path, method, trailing=trailing, budget=budget)
         if result == MATCH_FULL:
             full.append(chain)
         elif result != MATCH_NONE:
@@ -995,20 +1067,7 @@ def resolve_route(
         nearby = [c for c in considered if _is_ancestor_dir(_dirname(c.file), route_dir)]
         if nearby and len(nearby) < len(considered) and not partial:
             considered = nearby
-    resolution = _decide(considered, ignored, path, method, False, budget)
-    if resolution is None or resolution.decision != REQUIRED:
-        return resolution
-    variants: list[tuple[str, bool]] = []
-    segments = [s for s in path.split("/") if s]
-    if trailing_slash_reaches_handler and not path.endswith("/") and not (segments and _is_multi(segments[-1])):
-        variants.append((method, True))
-    if method == "GET":
-        variants.append(("HEAD", False))
-    for variant_method, trailing in variants:
-        other = _decide(considered, ignored, path, variant_method, trailing, budget)
-        if other is None or other.decision != REQUIRED:
-            return None
-    return resolution
+    return _decide(considered, ignored, path, method, trailing, budget)
 
 
 def _dirname(path: str) -> str:
@@ -1034,6 +1093,7 @@ __all__ = [
     "SecurityChain",
     "UNKNOWN",
     "evaluate_rules",
+    "literal_args",
     "match_path",
     "parse_security",
     "read_matcher_args",

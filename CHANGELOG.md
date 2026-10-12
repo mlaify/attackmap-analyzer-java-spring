@@ -28,7 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailing-slash form of exact Ant patterns, `HEAD` on `GET` handlers,
   ANONYMOUS authorities and SpEL `or`, method security that isn't switched on,
   `@PostAuthorize`, and `params=` handler variants. Applying rules to routes
-  shares a per-repo evaluation budget.
+  shares a per-repo cost budget (segment and glob work included). Anything
+  that can't be read with confidence is `unknown`: non-literal roles, SpEL
+  beyond plain `and` / `or` terms, a non-root `spring.mvc.servlet.path` or
+  Jersey `@ApplicationPath`, and `UrlHandlerFilter` trailing-slash handling.
 
 ### Changed
 

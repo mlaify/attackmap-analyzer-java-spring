@@ -46,6 +46,7 @@ from .annotations import (
     Annotation,
     AnnotationBlock,
     annotation_paths,
+    string_values,
     class_scopes,
     find_annotations,
     group_blocks,
@@ -147,7 +148,25 @@ ENABLE_METHOD_SECURITY = frozenset({"EnableMethodSecurity", "EnableGlobalMethodS
 JAXRS_ROLES_RE = re.compile(r"\bRolesAllowedDynamicFeature\b|\bio\.quarkus\.security\b")
 JAXRS_JSR250 = "jaxrs-jsr250"
 # Spring MVC trailing-slash matching switched on explicitly (it is off by default in Spring 6).
-TRAILING_SLASH_ON_RE = re.compile(r"\b(?:setUseTrailingSlashMatch|useTrailingSlashMatch)\s*\(\s*true\b|\bisUseTrailingSlashMatch\s*=\s*true\b")
+# Spring 6.2's `UrlHandlerFilter.trailingSlashHandler(..)` does the same by redirect or wrap.
+TRAILING_SLASH_ON_RE = re.compile(
+    r"\b(?:setUseTrailingSlashMatch|useTrailingSlashMatch)\s*\(\s*true\b|\bisUseTrailingSlashMatch\s*=\s*true\b"
+    r"|\bUrlHandlerFilter\b"
+)
+# A real `import jakarta.servlet...` line (Spring 6 / Boot 3), not a mention.
+JAKARTA_IMPORT_RE = re.compile(r"^[ \t]*import[ \t]+jakarta\.servlet\.", re.MULTILINE)
+# The DispatcherServlet or Jersey mounted below `/`: Ant matchers then see the
+# servlet path in front of the route, so the route's own path isn't what they match.
+SERVLET_PATH_PROPERTY_RE = re.compile(
+    r"^[ \t]*spring\.(mvc\.servlet\.path|jersey\.application-path)[ \t]*[=:][ \t]*[\"']?([^\s#\"']*)", re.MULTILINE
+)
+# One `key: value` YAML line (block mappings only; flow style and lists are skipped).
+YAML_LINE_RE = re.compile(r"([ ]*)([A-Za-z0-9_.\-]+)[ \t]*:(?:[ \t]+[\"']?([^\s#\"']*))?[ \t]*(?:#.*)?")
+SERVLET_PATH_KEYS = {"spring.mvc.servlet.path": "mvc", "spring.jersey.application-path": "jersey"}
+MAX_YAML_LINES = 20_000
+APPLICATION_PATH_RE = re.compile(r"@ApplicationPath\s*\(")
+_ROOT_PATHS = frozenset({"", "/", "/*", "/**"})
+CONFIG_SUFFIXES = {".properties", ".yml", ".yaml"}
 # Spring Boot major version in a Maven or Gradle build file.
 BOOT_VERSION_RE = re.compile(
     r"spring-boot-starter-parent</artifactId>\s*<version>\s*(\d+)\."
@@ -190,9 +209,14 @@ class RepoSecurity:
     files: dict[str, FileSecurity] = field(default_factory=dict)
     # File -> method-security switches it turns on (PREPOST / SECURED / JSR250 / JAXRS_JSR250).
     switches: dict[str, set[str]] = field(default_factory=dict)
-    # Files importing `jakarta.servlet` (Spring 6: no trailing-slash matching by default).
+    # Main-source files importing `jakarta.servlet` (Spring 6: no trailing-slash
+    # matching by default), used when no build file declares a Boot version.
     jakarta_files: set[str] = field(default_factory=set)
     trailing_slash_on: bool = False
+    # Files that mount the DispatcherServlet / Jersey below `/` (or set it to
+    # something unreadable); applied to routes in the same build module.
+    mvc_path_files: set[str] = field(default_factory=set)
+    jersey_path_files: set[str] = field(default_factory=set)
 
 
 def _is_test_path(relative: str) -> bool:
@@ -219,14 +243,26 @@ def _method_security(block: AnnotationBlock | None, relative: str, content: str)
         family = METHOD_SECURITY_FAMILIES.get(annotation.name)
         if family is None:
             continue
-        args = annotation.args or ""
+        sources = [*annotation.positional, *([annotation.named["value"]] if "value" in annotation.named else [])]
         if annotation.name == "PreAuthorize":
-            decision = spel_decision(args) if args.strip() else UNKNOWN
+            # One Java/Kotlin string literal; a concatenation or constant is unreadable.
+            values = string_values(sources[0]) if len(sources) == 1 else None
+            if values is not None and len(values) == 1 and "$" not in values[0]:
+                decision = spel_decision(values[0].replace('\\"', '"'))
+            else:
+                decision = UNKNOWN
         elif annotation.name in ("Secured", "RolesAllowed"):
-            if not args.strip():
+            roles: list[str] | None = [] if sources else None
+            for source in sources:
+                values = string_values(source)
+                if values is None or roles is None:
+                    roles = None
+                    break
+                roles.extend(values)
+            if not roles:
                 decision = UNKNOWN
             else:
-                decision = ANONYMOUS if ANONYMOUS_AUTHORITY_RE.search(args) else REQUIRED
+                decision = ANONYMOUS if any(ANONYMOUS_AUTHORITY_RE.search(r) for r in roles) else REQUIRED
         elif annotation.name == "DenyAll":
             decision = REQUIRED
         else:
@@ -580,6 +616,7 @@ class JavaSpringAnalyzer:
             self._extract_entrypoints(content, relative, result)
             self._infer_service_role(content, relative, result)
 
+        _read_servlet_paths(root, security)
         self._apply_route_auth(root, result, route_meta, security)
         result.languages.sort()
         return result
@@ -623,8 +660,10 @@ class JavaSpringAnalyzer:
         """
         if _is_test_path(relative):
             return
-        if "jakarta.servlet" in content:
+        if JAKARTA_IMPORT_RE.search(content) and JAKARTA_IMPORT_RE.search(mask_comments(content)):
             security.jakarta_files.add(relative)
+        if APPLICATION_PATH_RE.search(content) and _application_path_not_root(content):
+            security.jersey_path_files.add(relative)
         if not security.trailing_slash_on and TRAILING_SLASH_ON_RE.search(content):
             security.trailing_slash_on = True
         switches = _method_security_switches(content)
@@ -669,6 +708,8 @@ class JavaSpringAnalyzer:
         for relative, switches in security.switches.items():
             switches_by_module.setdefault(_module_of(root, relative, module_cache), set()).update(switches)
         jakarta_modules = {_module_of(root, relative, module_cache) for relative in security.jakarta_files}
+        mvc_path_modules = {_module_of(root, relative, module_cache) for relative in security.mvc_path_files}
+        jersey_path_modules = {_module_of(root, relative, module_cache) for relative in security.jersey_path_files}
         route_modules = {_module_of(root, r.file, module_cache) for r in result.routes}
         shared = [m for m in chains_by_module if m not in route_modules]
         shared_switches: set[str] = set()
@@ -693,15 +734,18 @@ class JavaSpringAnalyzer:
                 trailing = (
                     meta.kind == "jaxrs"
                     or security.trailing_slash_on
-                    or not (module in jakarta_modules or _is_spring6_module(root, module, spring6_cache))
+                    or not _is_spring6_module(root, module, module in jakarta_modules, spring6_cache)
                 )
-                try:
-                    chain_result = resolve_route(
-                        chains, ignored, route.path, route.method, route_dir,
-                        trailing_slash_reaches_handler=trailing, budget=budget,
-                    )
-                except BudgetExceeded:
-                    chain_result = None
+                # Under a servlet path the matchers see a different path than the route.
+                mounted_elsewhere = module in (jersey_path_modules if meta.kind == "jaxrs" else mvc_path_modules)
+                if not mounted_elsewhere:
+                    try:
+                        chain_result = resolve_route(
+                            chains, ignored, route.path, route.method, route_dir,
+                            trailing_slash_reaches_handler=trailing, budget=budget,
+                        )
+                    except BudgetExceeded:
+                        chain_result = None
             switches = switches_by_module.get(module, set()) | shared_switches
             method_security: MethodSecurity | None = None
             if meta.kind in FILTER_CHAIN_KINDS and meta.method_security:
@@ -933,29 +977,96 @@ class JavaSpringAnalyzer:
         result.service_hints.append(ServiceHint(hint=hint, file=file))
 
 
-def _is_spring6_module(root: Path, module: str, cache: dict[str, bool]) -> bool:
-    """True when the module's (or an enclosing) build file pins Spring Boot 3+."""
+def _declared_boot_major(text: str) -> int | None:
+    for match in BOOT_VERSION_RE.finditer(text):
+        version = next((g for g in match.groups() if g), None)
+        if version is not None:
+            return int(version)
+    return None
+
+
+def _is_spring6_module(root: Path, module: str, imports_jakarta: bool, cache: dict[str, bool]) -> bool:
+    """True when the module runs Spring Boot 3+ (Spring 6).
+
+    The nearest build file that declares a Boot version decides (a module's own
+    Boot 2 wins over the root's Boot 3). Only when none does, a main-source
+    `import jakarta.servlet...` in the module stands in for it.
+    """
     if module in cache:
         return cache[module]
-    found = False
+    major: int | None = None
     directory = module
     for _ in range(64):
         base = root / directory if directory else root
         for name in MODULE_BUILD_FILES:
             text = read_source(base / name, root=root) if (base / name).is_file() else None
-            if text is None:
-                continue
-            for match in BOOT_VERSION_RE.finditer(text):
-                version = next((g for g in match.groups() if g), None)
-                if version is not None and int(version) >= 3:
-                    found = True
+            if text is not None:
+                major = _declared_boot_major(text)
+                if major is not None:
                     break
-            if found:
-                break
-        if found or not directory:
+        if major is not None or not directory:
             break
         directory = directory.rsplit("/", 1)[0] if "/" in directory else ""
+    found = major >= 3 if major is not None else imports_jakarta
     cache[module] = found
+    return found
+
+
+def _application_path_not_root(content: str) -> bool:
+    """A JAX-RS `@ApplicationPath` that isn't `/` (or isn't a literal)."""
+    masked = mask_comments(content)
+    for annotation in find_annotations(masked, frozenset({"ApplicationPath"})):
+        paths = annotation_paths(annotation, ("value",))
+        if paths is None or any(p not in _ROOT_PATHS for p in paths):
+            return True
+    return False
+
+
+def _read_servlet_paths(root: Path, security: RepoSecurity) -> None:
+    """`spring.mvc.servlet.path` / `spring.jersey.application-path` below `/`
+    (or an unreadable value such as `${PATH}`) in application properties or YAML."""
+    for path in iter_repo_files(root, suffixes=CONFIG_SUFFIXES, skip_dirs=SKIP_DIRS):
+        name = path.name.lower()
+        if not (name.startswith("application") or name.startswith("bootstrap")):
+            continue
+        relative = rel(path, root)
+        if _is_test_path(relative):
+            continue
+        text = read_source(path, root=root)
+        if text is None:
+            continue
+        found = [(m.group(1), m.group(2)) for m in SERVLET_PATH_PROPERTY_RE.finditer(text)]
+        if path.suffix.lower() in (".yml", ".yaml"):
+            found += _yaml_servlet_paths(text)
+        for key, value in found:
+            if value not in _ROOT_PATHS:
+                (security.mvc_path_files if key.startswith("mvc") else security.jersey_path_files).add(relative)
+
+
+def _yaml_servlet_paths(text: str) -> list[tuple[str, str]]:
+    """`(kind, value)` for `spring.mvc.servlet.path` / `spring.jersey.application-path`
+    in a YAML file, following block-mapping indentation (`spring:` / `  mvc:` /
+    `    servlet:` / `      path: /app`) and dotted keys (`spring.mvc.servlet.path: /app`)."""
+    found: list[tuple[str, str]] = []
+    stack: list[tuple[int, str]] = []
+    for count, line in enumerate(text.splitlines()):
+        if count >= MAX_YAML_LINES:
+            break
+        if line.startswith("---"):
+            stack = []
+            continue
+        m = YAML_LINE_RE.fullmatch(line)
+        if m is None:
+            continue
+        indent = len(m.group(1))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        key = ".".join([k for _, k in stack] + [m.group(2)])
+        if m.group(3) is None or m.group(3) == "":
+            stack.append((indent, m.group(2)))
+        kind = SERVLET_PATH_KEYS.get(key)
+        if kind is not None:
+            found.append((kind, m.group(3) or ""))
     return found
 
 

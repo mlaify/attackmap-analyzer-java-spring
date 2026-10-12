@@ -243,7 +243,8 @@ def test_match_path_is_bounded_on_hostile_patterns() -> None:
     # Within the bounds, still exact.
     assert match_path("/**/**/**/**/x", "/" + "/".join(["a"] * 30)) == NONE
     assert match_path("/**/**/**/**/x", "/" + "/".join(["a"] * 30) + "/x") == FULL
-    assert match_path("/" + "*a" * 60, "/" + "a" * 120) == FULL
+    assert match_path("/" + "*a" * 8, "/" + "a" * 120) == FULL
+    assert match_path("/" + "*a" * 60, "/" + "a" * 120) == PARTIAL  # too many wildcards: undecided
 
 
 def test_read_matcher_args_forms() -> None:
@@ -277,7 +278,16 @@ def test_read_matcher_args_forms() -> None:
         ('access("hasAnyRole(\'ANONYMOUS\', \'USER\')")', "anonymous"),
         ('hasAnyRole("ANONYMOUS", "USER")', "anonymous"),
         ('hasAuthority("ROLE_ANONYMOUS")', "anonymous"),
-        ("hasAuthority(AuthoritiesConstants.ANONYMOUS)", "anonymous"),
+        # A non-literal authority can't be read: it might be anonymous.
+        ("hasAuthority(AuthoritiesConstants.ANONYMOUS)", "unknown"),
+        ("hasAuthority(AuthoritiesConstants.ADMIN)", "unknown"),
+        ('access("hasRole(@roles.ADMIN)")', "unknown"),
+        ('access("#id == principal.id")', "unknown"),
+        ('access("isAuthenticated() ? true : false")', "unknown"),
+        ('access("hasRole(\'A\') eq true")', "unknown"),
+        ('access("principal.enabled and isAuthenticated()")', "unknown"),
+        ("access(AuthorityAuthorizationManager.hasRole(ROLE))", "unknown"),
+        ('access(AuthorityAuthorizationManager.hasRole("ADMIN"))', "required"),
         ('hasAnyAuthority("ROLE_USER", "ROLE_ADMIN")', "required"),
         ('access("hasIpAddress(\'10.0.0.0/8\')")', "unknown"),
         ('access(new WebExpressionAuthorizationManager("isAuthenticated()"))', "required"),
@@ -362,13 +372,14 @@ def test_rules_apply_in_first_match_order(tmp_path: Path) -> None:
 
 
 def test_specific_role_rule_before_catch_all(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
     _write(tmp_path, "AdminController.java", _CONTROLLER)
     _write(tmp_path, "SecurityConfig.java", (
         'class SecurityConfig {\n'
         '    SecurityFilterChain chain(HttpSecurity http) {\n'
         '        http.authorizeHttpRequests(authz -> authz\n'
         '            .requestMatchers(HttpMethod.DELETE, "/admin/users/*").hasRole("SUPER")\n'
-        '            .requestMatchers("/admin/**").hasAuthority(AuthoritiesConstants.ADMIN)\n'
+        '            .requestMatchers("/admin/**").hasAuthority("ADMIN")\n'
         '            .anyRequest().permitAll());\n'
         '        if (dev) {\n'
         '            http.authorizeHttpRequests(authz -> authz.requestMatchers("/h2-console/**").permitAll());\n'
@@ -379,7 +390,7 @@ def test_specific_role_rule_before_catch_all(tmp_path: Path) -> None:
     ))
     result = JavaSpringAnalyzer().analyze(tmp_path)
     assert _route(result, "DELETE", "/admin/users/{id}").guards == ['hasRole("SUPER")']
-    assert _route(result, "POST", "/admin/users").guards == ["hasAuthority(AuthoritiesConstants.ADMIN)"]
+    assert _route(result, "POST", "/admin/users").guards == ['hasAuthority("ADMIN")']
     assert _route(result, "POST", "/api/orders").auth == "anonymous"
 
 
@@ -1099,3 +1110,191 @@ def test_hostile_configs_across_files_stay_fast(tmp_path: Path) -> None:
     # The budget ran out part-way: no route got a wrong answer, most stayed unknown.
     assert set(_auth(result).values()) <= {"required", "unknown"}
     assert "unknown" in set(_auth(result).values())
+
+
+# ---------- Review round 2 ----------
+
+
+def test_variant_forms_pick_their_own_chain(tmp_path: Path) -> None:
+    _write(tmp_path, "Api.java", (
+        '@RestController class Api { @GetMapping("/api/data") Object d() { return null; } }\n'
+    ))
+    # The API chain only covers GET; HEAD /api/data falls to the permit-all chain.
+    _write(tmp_path, "Sec.java", (
+        'class Sec {\n'
+        '    SecurityFilterChain api(HttpSecurity http) {\n'
+        '        http.securityMatcher(antMatcher(HttpMethod.GET, "/api/**"));\n'
+        '        return http.authorizeHttpRequests(a -> a.anyRequest().authenticated()).build();\n'
+        '    }\n'
+        '    SecurityFilterChain web(HttpSecurity http) {\n'
+        '        return http.authorizeHttpRequests(a -> a.anyRequest().permitAll()).build();\n'
+        '    }\n'
+        '}\n'
+    ))
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "GET", "/api/data").auth == "unknown"
+
+
+def test_lambda_security_matchers_with_a_method_are_opaque() -> None:
+    found = parse_security(
+        "class S { SecurityFilterChain c(HttpSecurity http) {\n"
+        '  http.securityMatchers(m -> m.requestMatchers(HttpMethod.POST, "/api/**"))\n'
+        "      .authorizeHttpRequests(a -> a.anyRequest().authenticated()); } }\n",
+        "S.java",
+    )
+    assert found.chains[0].scope is not None and found.chains[0].scope.opaque
+
+
+@pytest.mark.parametrize(
+    ("root_pom", "module_pom", "expected"),
+    [
+        ("3.2.5", "2.7.18", "unknown"),  # the module's own Boot 2 wins
+        ("2.7.18", None, "unknown"),
+        ("3.2.5", None, "required"),  # the module inherits the root's Boot 3
+        (None, "3.2.5", "required"),
+    ],
+)
+def test_nearest_build_file_decides_the_boot_version(
+    tmp_path: Path, root_pom: str | None, module_pom: str | None, expected: str
+) -> None:
+    if root_pom:
+        _write(tmp_path, "pom.xml", _BOOT3_POM.replace("3.2.5", root_pom))
+    if module_pom:
+        _write(tmp_path, "app/pom.xml", _BOOT3_POM.replace("3.2.5", module_pom))
+    else:
+        _write(tmp_path, "app/pom.xml", "<project><artifactId>app</artifactId></project>")
+    _write(tmp_path, "app/src/main/java/Admin.java", (
+        'import jakarta.servlet.http.HttpServletRequest;\n'
+        '@RestController class Admin { @PostMapping("/admin") Object a() { return null; } }\n'
+    ))
+    _write(tmp_path, "app/src/main/java/Sec.java", _sec('.requestMatchers("/admin").hasRole("A").anyRequest().permitAll()'))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin").auth == expected
+
+
+@pytest.mark.parametrize(
+    "jakarta",
+    [
+        "// import jakarta.servlet.http.HttpServletRequest;\n",
+        "/*\nimport jakarta.servlet.Filter;\n*/\n",
+        'String s = "jakarta.servlet";\n',
+    ],
+)
+def test_jakarta_mentions_that_are_not_imports_do_not_mean_spring6(tmp_path: Path, jakarta: str) -> None:
+    _write(tmp_path, "Admin.java", jakarta + '@RestController class Admin { @PostMapping("/admin") Object a() { return null; } }\n')
+    _write(tmp_path, "Sec.java", _sec('.requestMatchers("/admin").hasRole("A").anyRequest().permitAll()'))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin").auth == "unknown"
+
+
+def test_jakarta_import_in_test_source_does_not_mean_spring6(tmp_path: Path) -> None:
+    _write(tmp_path, "src/test/java/T.java", "import jakarta.servlet.Filter;\nclass T {}\n")
+    _write(tmp_path, "src/main/java/Admin.java", '@RestController class Admin { @PostMapping("/admin") Object a() { return null; } }\n')
+    _write(tmp_path, "src/main/java/Sec.java", _sec('.requestMatchers("/admin").hasRole("A").anyRequest().permitAll()'))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin").auth == "unknown"
+
+
+def test_url_handler_filter_turns_the_trailing_slash_check_back_on(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "Admin.java", '@RestController class Admin { @PostMapping("/admin") Object a() { return null; } }\n')
+    _write(tmp_path, "Sec.java", _sec('.requestMatchers("/admin").hasRole("A").anyRequest().permitAll()'))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin").auth == "required"
+    _write(tmp_path, "Web.java", (
+        "class Web { @Bean UrlHandlerFilter f() { return UrlHandlerFilter.trailingSlashHandler(\"/**\").wrapRequest().build(); } }\n"
+    ))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin").auth == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("config_name", "config", "expected"),
+    [
+        ("application.properties", "spring.mvc.servlet.path=/app\n", "unknown"),
+        ("application.properties", "spring.mvc.servlet.path=/\n", "required"),
+        ("application.properties", "server.servlet.context-path=/ctx\n", "required"),
+        ("application.yml", "spring:\n  mvc:\n    servlet:\n      path: /app\n", "unknown"),
+        ("application-prod.yaml", "spring.mvc.servlet.path: /app\n", "unknown"),
+        ("application.yml", "spring:\n  mvc.servlet.path: ${APP_PATH}\n", "unknown"),
+        # springdoc's `path:` and unrelated `mvc:` / `servlet:` keys are not the servlet path.
+        (
+            "application.yml",
+            "spring:\n  thymeleaf:\n    servlet:\n      content-type: text/html\n  mvc:\n    pathmatch:\n"
+            "      matching-strategy: ant_path_matcher\nspringdoc:\n  swagger-ui:\n    path: /swagger-ui.html\n",
+            "required",
+        ),
+    ],
+)
+def test_dispatcher_servlet_path_makes_spring_routes_unknown(
+    tmp_path: Path, config_name: str, config: str, expected: str
+) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, f"src/main/resources/{config_name}", config)
+    _write(tmp_path, "src/main/java/Admin.java", '@RestController class Admin { @PostMapping("/admin/x") Object a() { return null; } }\n')
+    _write(tmp_path, "src/main/java/Sec.java", _sec('.requestMatchers("/admin/**").hasRole("A").anyRequest().permitAll()'))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin/x").auth == expected
+
+
+@pytest.mark.parametrize(
+    ("app_path", "expected"),
+    [('@ApplicationPath("/api")', "unknown"), ('@ApplicationPath("/")', "required"), ("@ApplicationPath(Paths.API)", "unknown")],
+)
+def test_jersey_application_path_makes_jaxrs_routes_unknown(tmp_path: Path, app_path: str, expected: str) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "App.java", f"{app_path}\nclass App extends ResourceConfig {{}}\n")
+    _write(tmp_path, "Res.java", 'import jakarta.ws.rs.*;\n@Path("/admin") public class Res { @POST @Path("/x/") public void a() {} }\n')
+    _write(tmp_path, "Sec.java", _sec('.requestMatchers("/admin/**").hasRole("A").anyRequest().permitAll()'))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin/x/").auth == expected
+
+
+def test_method_security_needs_literal_arguments(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "Api.java", (
+        '@RestController class Api {\n'
+        '    @PreAuthorize("hasAuthority(\\"" + AuthoritiesConstants.ADMIN + "\\")") @PostMapping("/concat") Object a() { return null; }\n'
+        '    @Secured(Roles.ADMIN) @PostMapping("/const") Object b() { return null; }\n'
+        '    @PreAuthorize("hasAuthority(\\"ROLE_ADMIN\\")") @PostMapping("/escaped") Object c() { return null; }\n'
+        '    @PreAuthorize(value = "hasRole(\'A\') and isAuthenticated()") @PostMapping("/named") Object d() { return null; }\n'
+        '}\n'
+    ))
+    _write(tmp_path, "Sec.java", _sec(
+        '.anyRequest().permitAll()', extra="@EnableMethodSecurity(securedEnabled = true)\n"
+    ))
+    auth = _auth(JavaSpringAnalyzer().analyze(tmp_path))
+    assert auth[("POST", "/concat")] == "unknown"
+    assert auth[("POST", "/const")] == "unknown"
+    assert auth[("POST", "/escaped")] == "required"
+    assert auth[("POST", "/named")] == "required"
+
+
+@pytest.mark.parametrize("wildcards", [63, 8])
+def test_adversarial_glob_rules_stay_fast(tmp_path: Path, wildcards: int) -> None:
+    import time
+
+    # 63 wildcards is over the per-segment cap; 8 is at it, so the cost budget does the work.
+    glob = "a*" * wildcards + "a" * (127 - 2 * wildcards)
+    rule = f'.requestMatchers("/**/{glob}/**/x").hasRole("A")'
+    _write(tmp_path, "Sec.java", _sec(rule * 450 + ".anyRequest().permitAll()"))
+    route = "/" + "/".join(["a" * 127] * 32)
+    _write(tmp_path, "Api.java", (
+        "@RestController class Api {\n"
+        + "".join(f'    @PostMapping("{route}{i}") Object r{i}() {{ return null; }}\n' for i in range(20))
+        + "}\n"
+    ))
+    start = time.perf_counter()
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert time.perf_counter() - start < 10
+    assert set(_auth(result).values()) <= {"anonymous", "unknown"}
+
+
+def test_glob_cost_is_charged_to_the_budget() -> None:
+    from attackmap_analyzer_java_spring.security_dsl import Budget, BudgetExceeded
+
+    with pytest.raises(BudgetExceeded):
+        match_path("/x*y*z/**", "/" + "x" * 120 + "/a", budget=Budget(500))
+
+
+def test_servlet_path_applies_only_to_its_module(tmp_path: Path) -> None:
+    for module in ("a", "b"):
+        _write(tmp_path, f"{module}/pom.xml", _BOOT3_POM)
+        _write(tmp_path, f"{module}/src/main/java/Admin.java", '@RestController class Admin { @PostMapping("/admin/x") Object a() { return null; } }\n')
+        _write(tmp_path, f"{module}/src/main/java/Sec.java", _sec('.requestMatchers("/admin/**").hasRole("A").anyRequest().permitAll()'))
+    _write(tmp_path, "a/src/main/resources/application.properties", "spring.mvc.servlet.path=/app\n")
+    by_module = {r.file.split("/")[0]: r.auth for r in JavaSpringAnalyzer().analyze(tmp_path).routes}
+    assert by_module == {"a": "unknown", "b": "required"}
