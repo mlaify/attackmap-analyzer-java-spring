@@ -35,20 +35,20 @@ def _write(root: Path, rel: str, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _table(*sources: str) -> ConstantTable:
+def _table(*sources: str, kotlin: bool = False) -> ConstantTable:
     table = ConstantTable()
     for source in sources:
-        table.collect(mask_comments(source))
+        table.collect(mask_comments(source), kotlin=kotlin)
     return table
 
 
 def test_collects_java_static_final_and_kotlin_const_val() -> None:
-    table = _table(
-        _AUTHORITIES,
+    table = _table(_AUTHORITIES)
+    table.collect(mask_comments(
         'object Roles { const val USER = "ROLE_USER" }\n'
         'class Paths { companion object { const val ADMIN: String = "/admin" } }\n'
-        'const val TOP = "/top"\n',
-    )
+        'const val TOP = "/top"\n'
+    ), kotlin=True)
     assert table.lookup("AuthoritiesConstants.ADMIN") == "ROLE_ADMIN"
     assert table.lookup("Roles.USER") == "ROLE_USER"
     assert table.lookup("Paths.ADMIN") == "/admin"
@@ -98,8 +98,9 @@ def test_collection_is_bounded() -> None:
     start = time.perf_counter()
     table = _table("class K {\n" + body + "}\n")
     assert time.perf_counter() - start < 5
-    assert table.lookup("K.C10") == "v10"
-    assert table.lookup("K.C4999") is None  # past the per-file cap
+    # Past the per-file cap declarations were dropped, so nothing resolves.
+    assert table.overflow
+    assert table.lookup("K.C10") is None
 
 
 def _app(tmp_path: Path, controller: str, rules: str) -> dict[tuple[str, str], str]:
@@ -161,3 +162,93 @@ def test_constants_declared_only_in_tests_are_not_used(tmp_path: Path) -> None:
         ".anyRequest().permitAll()).build(); } }\n"
     ))
     assert JavaSpringAnalyzer().analyze(tmp_path).routes[0].auth == "unknown"
+
+
+# ---------- Review: never resolve to the wrong value ----------
+
+
+@pytest.mark.parametrize(
+    ("declaration", "expected"),
+    [
+        ('const val R = "ROLE_" + "ANONYMOUS"', "ROLE_ANONYMOUS"),
+        ('const val R: String = "ROLE_ADMIN"', "ROLE_ADMIN"),
+        ('const val R = """ROLE_ANONYMOUS"""', None),
+        ('const val R = "ROLE_" + OTHER', None),
+        ('const val R = "ROLE_$X"', None),
+        ('const val R =\n        "ROLE_ADMIN"', None),
+        ('val R = "ROLE_ADMIN"', None),
+    ],
+)
+def test_kotlin_const_val_reads_the_whole_value(declaration: str, expected: str | None) -> None:
+    table = _table(f"object Roles {{\n    {declaration}\n}}\n", kotlin=True)
+    assert table.lookup("Roles.R") == expected
+
+
+@pytest.mark.parametrize(
+    ("other", "expected"),
+    [
+        # The same declaration again (another copy of the file) is fine.
+        ('package b; class Roles { public static final String ADMIN = "ROLE_ADMIN"; }', "ROLE_ADMIN"),
+        # Any other declaration of Roles.ADMIN poisons the key.
+        ('package b; class Roles { public static final String ADMIN = "ROLE_ROOT"; }', None),
+        ('package b; class Roles { public static String ADMIN = "ROLE_ADMIN"; }', None),
+        ('package b; class Roles { static final Object ADMIN = "ROLE_ADMIN"; }', None),
+        ("package b; class Roles { static final String ADMIN; static { ADMIN = load(); } }", None),
+        ('package b; class Roles { static final String ADMIN = System.getenv("R"); }', None),
+        ('package b; class Roles { static final String ADMIN = """\n  ROLE_ADMIN"""; }', None),
+        ('class Sec { static class Roles { static final String ADMIN = "ROLE_ANONYMOUS"; } }', None),
+        ("enum Roles { ADMIN, USER }", None),
+        ('package b; class Roles { static final String A = "x", ADMIN = "ROLE_ADMIN"; }', None),
+    ],
+)
+def test_every_declaration_of_a_key_must_agree(other: str, expected: str | None) -> None:
+    base = 'package a; public final class Roles { public static final String ADMIN = "ROLE_ADMIN"; }'
+    assert _table(base, other).lookup("Roles.ADMIN") == expected
+
+
+def test_kotlin_property_poisons_a_java_constant_of_the_same_key() -> None:
+    table = _table('class Roles { static final String ADMIN = "ROLE_ADMIN"; }')
+    table.collect(mask_comments('class Roles { companion object { var ADMIN = "ROLE_ANONYMOUS" } }'), kotlin=True)
+    assert table.lookup("Roles.ADMIN") is None
+
+
+def test_enums_records_and_interfaces_are_keyed_under_their_own_name() -> None:
+    table = _table(
+        'enum Level { LOW, HIGH("h"); public static final String PREFIX = "ROLE_"; Level() {} Level(String s) {} }\n'
+        'record Point(int x) { static final String KIND = "point"; }\n'
+        'interface Roles { String ADMIN = "ROLE_ADMIN"; Object OTHER = "x"; String user(); }\n'
+    )
+    assert table.lookup("Level.LOW") is None  # an enum constant, not a String
+    assert table.lookup("Level.HIGH") is None
+    assert table.lookup("Level.PREFIX") == "ROLE_"
+    assert table.lookup("Point.KIND") == "point"
+    assert table.lookup("Roles.ADMIN") == "ROLE_ADMIN"  # implicitly static final
+    assert table.lookup("Roles.OTHER") is None
+
+
+def test_hitting_the_constant_cap_makes_every_lookup_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    import attackmap_analyzer_java_spring.constants as constants
+
+    monkeypatch.setattr(constants, "MAX_CONSTANTS", 2)
+    table = _table('class A { static final String X = "a"; static final String Y = "b"; }')
+    assert table.lookup("A.X") == "a"
+    # A third declaration (which might have conflicted) is dropped: nothing resolves now.
+    table.collect(mask_comments('class A { static final String X = "c"; }'))
+    assert table.overflow and table.lookup("A.X") is None
+
+
+def test_kotlin_concatenated_anonymous_constant_is_not_required(tmp_path: Path) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "src/main/kotlin/Roles.kt", 'object Roles {\n    const val ANON = "ROLE_" + "ANONYMOUS"\n}\n')
+    _write(tmp_path, "src/main/java/Api.java", '@RestController class Api { @PostMapping("/x") Object a() { return null; } }\n')
+    _write(tmp_path, "src/main/java/Sec.java", (
+        "class Sec { SecurityFilterChain c(HttpSecurity http) {\n"
+        "    return http.authorizeHttpRequests(a -> a.requestMatchers(\"/x\").hasAuthority(Roles.ANON)"
+        ".anyRequest().authenticated()).build(); } }\n"
+    ))
+    assert JavaSpringAnalyzer().analyze(tmp_path).routes[0].auth == "anonymous"
+
+
+def test_java_constant_split_across_lines() -> None:
+    table = _table('class Roles {\n    public static final String ADMIN =\n        "ROLE_" +\n        "ADMIN";\n}\n')
+    assert table.lookup("Roles.ADMIN") == "ROLE_ADMIN"

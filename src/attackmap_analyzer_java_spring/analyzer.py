@@ -710,7 +710,7 @@ class JavaSpringAnalyzer:
             return
         masked = mask_comments(content)
         if declares_constants:
-            security.constants.collect(masked)
+            security.constants.collect(masked, kotlin=relative.endswith((".kt", ".kts")))
         if gated:
             security.pending[relative] = masked
 
