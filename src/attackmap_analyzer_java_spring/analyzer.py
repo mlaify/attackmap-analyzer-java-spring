@@ -24,11 +24,20 @@ path. Annotation arguments are parsed (bare, positional, `value=`/`path=`/
 `uri=`, Java `{...}` and Kotlin `[...]`/`arrayOf(...)` arrays, `method =`
 lists) by `annotations.py`, and a class prefix applies only inside that class's
 body (found by brace matching).
+
+Functional endpoints (`RouterFunctions`, the `route()` builder, Kotlin
+`router {}` / `coRouter {}`) are read by `functional.py`. Route auth (#3):
+Spring Security `authorizeHttpRequests` / `authorizeRequests` /
+`authorizeExchange` rules (`security_dsl.py`) are applied to Spring, JAX-RS and
+functional routes in first-match order, together with method security
+(`@PreAuthorize`, `@Secured`, `@RolesAllowed`, `@DenyAll`, `@PermitAll`), and
+the result is recorded on `Route.auth` / `guards` / `guard_evidence`.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
@@ -42,6 +51,18 @@ from .annotations import (
     group_blocks,
     innermost_scope,
     mask_comments,
+)
+from .functional import FUNCTIONAL_GATE_RE, functional_routes
+from .security_dsl import (
+    ANONYMOUS,
+    REQUIRED,
+    SECURITY_GATE_RE,
+    FileSecurity,
+    Resolution,
+    Rule,
+    SecurityChain,
+    parse_security,
+    resolve_route,
 )
 
 from .contracts import (
@@ -105,10 +126,80 @@ JAVALIN_ROUTE_PATTERN = re.compile(
     r'\bapp\.(get|post|put|delete|patch|head|options)\s*\(\s*"([^"]+)"',
 )
 
+# Method security annotations (Spring and JSR-250) on a handler or its class.
+METHOD_SECURITY_ANNOTATIONS = frozenset({"PreAuthorize", "PostAuthorize", "Secured", "RolesAllowed", "DenyAll", "PermitAll"})
+_METHOD_SECURITY_PERMIT_RE = re.compile(r"\b(?:permitAll|isAnonymous|IS_AUTHENTICATED_ANONYMOUSLY)\b")
+_METHOD_SECURITY_REQUIRED_RE = re.compile(
+    r"\b(?:hasRole|hasAnyRole|hasAuthority|hasAnyAuthority|hasPermission|isAuthenticated|"
+    r"isFullyAuthenticated|isRememberMe|denyAll|authentication|principal|ROLE_\w+|"
+    r"IS_AUTHENTICATED_FULLY|IS_AUTHENTICATED_REMEMBERED)\b"
+)
+# Route kinds Spring Security's filter chain sits in front of. Micronaut, Ktor
+# and Javalin routes have their own security and are left alone.
+FILTER_CHAIN_KINDS = frozenset({"spring", "jaxrs", "functional"})
+MODULE_BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts")
+# Directory names whose security configs are test-only and never guard a route.
+_TEST_DIR_NAMES = frozenset({"test", "tests", "testfixtures", "integrationtest", "it", "e2e"})
+_ANNOTATION_TEXT_CHARS = 120
+
+
+@dataclass
+class MethodSecurity:
+    decision: str  # REQUIRED or ANONYMOUS
+    guard: str
+    evidence: str
+
+
+@dataclass
+class RouteMeta:
+    kind: str  # spring / jaxrs / functional / micronaut / ktor / javalin
+    method_security: MethodSecurity | None = None
+
+
+def _is_test_path(relative: str) -> bool:
+    return any(part.lower() in _TEST_DIR_NAMES for part in relative.split("/")[:-1])
+
+
+def _annotation_text(annotation: Annotation) -> str:
+    text = f"@{annotation.name}" if annotation.args is None else f"@{annotation.name}({' '.join(annotation.args.split())})"
+    return text if len(text) <= _ANNOTATION_TEXT_CHARS else text[: _ANNOTATION_TEXT_CHARS - 1] + "…"
+
+
+def _method_security(block: AnnotationBlock | None, relative: str, content: str) -> MethodSecurity | None:
+    """Auth a method-security annotation in ``block`` declares, if any.
+
+    `@PermitAll`, `@PreAuthorize("permitAll()")` and `@Secured("IS_AUTHENTICATED_ANONYMOUSLY")`
+    open the method; every other method-security annotation requires an
+    authenticated caller.
+    """
+    if block is None:
+        return None
+    for annotation in block.annotations:
+        if annotation.name not in METHOD_SECURITY_ANNOTATIONS:
+            continue
+        args = annotation.args or ""
+        if annotation.name == "PermitAll" or (
+            annotation.name in {"PreAuthorize", "Secured"}
+            and _METHOD_SECURITY_PERMIT_RE.search(args)
+            and not _METHOD_SECURITY_REQUIRED_RE.search(args)
+        ):
+            decision = ANONYMOUS
+        else:
+            decision = REQUIRED
+        text = _annotation_text(annotation)
+        return MethodSecurity(decision, text, f"{relative}:{line_of(content, annotation.start)} {text}")
+    return None
+
+
+# `RequestMethod.POST`, or a statically imported `POST`.
+REQUEST_METHOD_RE = re.compile(r"(?<![\w$])(?:RequestMethod\.)?(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b")
+
+
 def _spring_methods(annotation: Annotation) -> list[str]:
-    """HTTP methods of a `@RequestMapping` (`method = RequestMethod.X` or an array)."""
+    """HTTP methods of a `@RequestMapping` (`method = RequestMethod.X`, a
+    statically imported `method = POST`, or an array)."""
     value = annotation.named.get("method", "")
-    methods = re.findall(r"RequestMethod\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b", value)
+    methods = REQUEST_METHOD_RE.findall(value)
     return list(dict.fromkeys(methods)) or ["ANY"]
 
 
@@ -289,22 +380,27 @@ def _class_block_paths(block: AnnotationBlock, is_jaxrs: bool, is_micronaut: boo
 
 def _member_routes(
     block: AnnotationBlock, is_jaxrs: bool, is_micronaut: bool
-) -> list[tuple[Annotation, str, list[str]]]:
-    """(anchor annotation, HTTP method, member paths) for a member's block."""
-    routes: list[tuple[Annotation, str, list[str]]] = []
+) -> list[tuple[Annotation, str, list[str], str]]:
+    """(anchor annotation, HTTP method, member paths, kind) for a member's block.
+
+    A JAX-RS verb pairs only with the `@Path` in its own block, i.e. the
+    annotations between the previous member and this method's signature, so a
+    neighbouring method's path is never borrowed (#3).
+    """
+    routes: list[tuple[Annotation, str, list[str], str]] = []
     for annotation in block.annotations:
         if annotation.name in SPRING_VERB_MAPPINGS:
             paths = annotation_paths(annotation, SPRING_PATH_KEYS)
             if paths is not None:
-                routes.append((annotation, SPRING_VERB_MAPPINGS[annotation.name], paths))
+                routes.append((annotation, SPRING_VERB_MAPPINGS[annotation.name], paths, "spring"))
         elif annotation.name == "RequestMapping":
             paths = annotation_paths(annotation, SPRING_PATH_KEYS)
             if paths is not None:
-                routes.extend((annotation, method, paths) for method in _spring_methods(annotation))
+                routes.extend((annotation, method, paths, "spring") for method in _spring_methods(annotation))
         elif is_micronaut and annotation.name in MICRONAUT_VERBS:
             paths = annotation_paths(annotation, MICRONAUT_PATH_KEYS)
             if paths is not None:
-                routes.append((annotation, MICRONAUT_VERBS[annotation.name], paths))
+                routes.append((annotation, MICRONAUT_VERBS[annotation.name], paths, "micronaut"))
     if is_jaxrs:
         verbs = [a for a in block.annotations if a.name in JAXRS_VERBS and a.args is None]
         if verbs:
@@ -312,7 +408,7 @@ def _member_routes(
             paths = annotation_paths(path_annotation, ("value",)) if path_annotation else [""]
             if paths is not None:
                 anchor = path_annotation or verbs[0]
-                routes.extend((anchor, verb.name, paths) for verb in verbs)
+                routes.extend((anchor, verb.name, paths, "jaxrs") for verb in verbs)
     return routes
 
 
@@ -365,6 +461,8 @@ class JavaSpringAnalyzer:
         if spring_app:
             self._append_unique_service(result, f"spring_app:{spring_app}", "application.properties")
 
+        route_meta: dict[tuple[str, str, str], RouteMeta] = {}
+        security: dict[str, FileSecurity] = {}
         for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
             content = read_source(file_path, root=root)
             if content is None:
@@ -376,7 +474,8 @@ class JavaSpringAnalyzer:
                 result.languages.append(language)
 
             relative = rel(file_path, root)
-            self._extract_routes(content, relative, result)
+            self._extract_routes(content, relative, result, route_meta)
+            self._extract_security_rules(content, relative, security)
             self._extract_databases(content, relative, result)
             self._extract_auth(content, relative, result)
             self._extract_secrets(content, relative, result)
@@ -385,27 +484,108 @@ class JavaSpringAnalyzer:
             self._extract_entrypoints(content, relative, result)
             self._infer_service_role(content, relative, result)
 
+        self._apply_route_auth(root, result, route_meta, security)
         result.languages.sort()
         return result
 
     # ---------- Extractors ----------
 
-    def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
-        self._extract_annotation_routes(content, relative, result)
+    def _extract_routes(
+        self,
+        content: str,
+        relative: str,
+        result: ScanResult,
+        route_meta: dict[tuple[str, str, str], RouteMeta] | None = None,
+    ) -> None:
+        meta = route_meta if route_meta is not None else {}
+        self._extract_annotation_routes(content, relative, result, meta)
 
         # Ktor: routing { get("/x") { ... } }
         if "io.ktor" in content or "ktor.server.routing" in content:
             for match in KTOR_ROUTE_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()), meta, RouteMeta("ktor"))
 
         # Javalin: app.get("/x", ...)
         if "io.javalin" in content or "Javalin.create" in content:
             for match in JAVALIN_ROUTE_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()), meta, RouteMeta("javalin"))
 
-    def _extract_annotation_routes(self, content: str, relative: str, result: ScanResult) -> None:
+        # Spring functional endpoints: RouterFunctions / route() builder /
+        # Kotlin router {} and coRouter {} (#3).
+        if FUNCTIONAL_GATE_RE.search(content):
+            for route in functional_routes(mask_comments(content)):
+                self._append_unique_route(
+                    result, route.path, route.method, relative, line_of(content, route.offset), meta, RouteMeta("functional")
+                )
+
+    def _extract_security_rules(self, content: str, relative: str, security: dict[str, FileSecurity]) -> None:
+        """Spring Security authorization rules in ``content`` (#3).
+
+        Test configurations (`src/test/...`) never guard a deployed route.
+        """
+        if _is_test_path(relative) or not SECURITY_GATE_RE.search(content):
+            return
+        parsed = parse_security(mask_comments(content), relative)
+        if parsed.chains or parsed.ignored:
+            security[relative] = parsed
+
+    def _apply_route_auth(
+        self,
+        root: Path,
+        result: ScanResult,
+        route_meta: dict[tuple[str, str, str], RouteMeta],
+        security: dict[str, FileSecurity],
+    ) -> None:
+        """Set `Route.auth` from filter-chain rules and method security.
+
+        A chain applies to routes in its own build module (nearest `pom.xml` /
+        `build.gradle`); a module with routes but no chain of its own uses the
+        chains of route-less modules (a shared security library). Method security
+        can only narrow access: it turns an `anonymous` chain decision into
+        `required`, and `@PermitAll` never opens a route the chain protects.
+        """
+        module_cache: dict[str, str] = {}
+        chains_by_module: dict[str, list[SecurityChain]] = {}
+        ignored_by_module: dict[str, list[Rule]] = {}
+        for relative, parsed in security.items():
+            module = _module_of(root, relative, module_cache)
+            chains_by_module.setdefault(module, []).extend(parsed.chains)
+            ignored_by_module.setdefault(module, []).extend(parsed.ignored)
+        route_modules = {_module_of(root, r.file, module_cache) for r in result.routes}
+        shared = [m for m in chains_by_module if m not in route_modules]
+
+        for route in result.routes:
+            meta = route_meta.get((route.path, route.method, route.file))
+            if meta is None:
+                continue
+            chain_result: Resolution | None = None
+            if meta.kind in FILTER_CHAIN_KINDS and chains_by_module:
+                module = _module_of(root, route.file, module_cache)
+                modules = [module] if module in chains_by_module else shared
+                chains = [c for m in modules for c in chains_by_module[m]]
+                ignored = [r for m in modules for r in ignored_by_module.get(m, [])]
+                route_dir = route.file.rsplit("/", 1)[0] if "/" in route.file else ""
+                chain_result = resolve_route(chains, ignored, route.path, route.method, route_dir)
+            method_security = meta.method_security
+            method_required = method_security is not None and method_security.decision == REQUIRED
+            if chain_result is not None and chain_result.decision == REQUIRED:
+                route.auth = "required"
+                route.guards = [*chain_result.guards, *([method_security.guard] if method_required else [])]
+                route.guard_evidence = chain_result.evidence
+            elif method_required:
+                route.auth = "required"
+                route.guards = [method_security.guard]
+                route.guard_evidence = method_security.evidence
+            elif chain_result is not None and chain_result.decision == ANONYMOUS:
+                route.auth = "anonymous"
+                route.guards = []
+                route.guard_evidence = chain_result.evidence
+
+    def _extract_annotation_routes(
+        self, content: str, relative: str, result: ScanResult, meta: dict[tuple[str, str, str], RouteMeta]
+    ) -> None:
         """Spring MVC, JAX-RS and Micronaut annotation routes (#2).
 
         Each annotation block is attributed to a class (its paths become the
@@ -425,11 +605,13 @@ class JavaSpringAnalyzer:
         blocks = group_blocks(masked, annotations)
         scopes = class_scopes(masked)
 
-        # Class keyword offset -> that class's path prefixes.
+        # Class keyword offset -> that class's path prefixes / annotation block.
         class_paths: dict[int, list[str]] = {}
+        class_blocks: dict[int, AnnotationBlock] = {}
         for block in blocks:
             if block.class_keyword_at is None:
                 continue
+            class_blocks[block.class_keyword_at] = block
             prefixes = _class_block_paths(block, is_jaxrs, is_micronaut)
             if prefixes is not None:
                 class_paths[block.class_keyword_at] = prefixes
@@ -437,13 +619,23 @@ class JavaSpringAnalyzer:
         for block in blocks:
             if block.class_keyword_at is not None:
                 continue
+            members = _member_routes(block, is_jaxrs, is_micronaut)
+            if not members:
+                continue
             scope = innermost_scope(scopes, block.annotations[0].start)
             prefixes = class_paths.get(scope.keyword_at, [""]) if scope is not None else [""]
-            for annotation, method, paths in _member_routes(block, is_jaxrs, is_micronaut):
+            # Method-level security overrides class-level security.
+            security = _method_security(block, relative, content) or (
+                _method_security(class_blocks.get(scope.keyword_at), relative, content) if scope is not None else None
+            )
+            for annotation, method, paths, kind in members:
                 line = line_of(content, annotation.start)
+                route_meta = RouteMeta(kind, security if kind in FILTER_CHAIN_KINDS else None)
                 for prefix in prefixes:
                     for suffix in paths:
-                        self._append_unique_route(result, _route_path(prefix, suffix), method, relative, line)
+                        self._append_unique_route(
+                            result, _route_path(prefix, suffix), method, relative, line, meta, route_meta
+                        )
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -528,11 +720,23 @@ class JavaSpringAnalyzer:
     # ---------- Append helpers ----------
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int | None) -> None:
+    def _append_unique_route(
+        result: ScanResult,
+        path: str,
+        method: str,
+        file: str,
+        line: int | None,
+        route_meta: dict[tuple[str, str, str], RouteMeta] | None = None,
+        meta: RouteMeta | None = None,
+    ) -> None:
         key = (path, method, file)
+        if route_meta is not None and key in route_meta:
+            return
         if any((item.path, item.method, item.file) == key for item in result.routes):
             return
         result.routes.append(Route(path=path, method=method, file=file, line=line))
+        if route_meta is not None and meta is not None:
+            route_meta[key] = meta
 
     @staticmethod
     def _append_unique_database(result: ScanResult, kind: str, file: str, line: int | None, evidence: str | None) -> None:
@@ -582,6 +786,29 @@ class JavaSpringAnalyzer:
         if any((item.hint, item.file) == key for item in result.service_hints):
             return
         result.service_hints.append(ServiceHint(hint=hint, file=file))
+
+
+def _module_of(root: Path, relative: str, cache: dict[str, str]) -> str:
+    """Directory (relative to ``root``) of the nearest build file above ``relative``.
+
+    ``cache`` maps every directory already looked at to its module.
+    """
+    directory = relative.rsplit("/", 1)[0] if "/" in relative else ""
+    walked: list[str] = []
+    found = ""
+    while True:
+        if directory in cache:
+            found = cache[directory]
+            break
+        walked.append(directory)
+        base = root / directory if directory else root
+        if not directory or any((base / name).is_file() for name in MODULE_BUILD_FILES):
+            found = directory
+            break
+        directory = directory.rsplit("/", 1)[0] if "/" in directory else ""
+    for seen in walked:
+        cache[seen] = found
+    return found
 
 
 __all__ = ["JavaSpringAnalyzer"]

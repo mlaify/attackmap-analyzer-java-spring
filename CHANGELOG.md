@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Spring WebFlux / WebMvc.fn functional endpoints become routes
+  ([#3](https://github.com/mlaify/attackmap-analyzer-java-spring/issues/3)):
+  `RouterFunctions.route(GET("/x"), h).andRoute(...)`, `nest(path("/api"), ...)` /
+  `.andNest(...)`, the `route().GET("/x", h).path("/api", b -> ...)` builder and
+  Kotlin `router {}` / `coRouter {}` with `"/api".nest {}`. Unreadable paths and
+  prefixes are skipped, never guessed.
+- Spring Security `authorizeHttpRequests` / `authorizeRequests` /
+  `authorizeExchange` rules (lambda, pre-lambda and Kotlin DSL forms,
+  `web.ignoring()`, `securityMatcher` scopes) are applied to each Spring, JAX-RS
+  and functional route in first-match order with Ant-style matching, together
+  with method security (`@PreAuthorize`, `@Secured`, `@RolesAllowed`,
+  `@DenyAll`, `@PermitAll`). The result is set on `Route.auth` / `guards` /
+  `guard_evidence` (mlaify/AttackMap#256), so `requestMatchers("/admin/**").permitAll()`
+  now makes those routes explicitly anonymous with the rule as evidence.
+
 ### Changed
 
 - Walk and read the repo with the shared `attackmap.sdk.fs` helpers
@@ -18,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([mlaify/AttackMap#221](https://github.com/mlaify/AttackMap/issues/221)).
 
 ### Fixed
+
+- `@RequestMapping(method = POST)` with a statically imported `RequestMethod`
+  gives a `POST` route instead of `ANY`.
+- JAX-RS: a regression test pins that a verb pairs only with its own method's
+  `@Path` and each resource class uses its own class `@Path` (#3; the pairing
+  itself was scoped to the method's annotation block in #2).
 
 - Spring MVC mappings are read with an annotation-argument parser instead of
   single-string regexes, so these shapes now produce routes with the right
