@@ -147,6 +147,67 @@ def match_bracket(content: str, open_at: int) -> int | None:
     return None
 
 
+def bracket_end(text: str, open_at: int, limit: int = 50_000) -> int | None:
+    """`match_bracket` that looks at most ``limit`` characters ahead, so an
+    unbalanced bracket in a large hostile file costs O(limit), not O(file)."""
+    if open_at + limit >= len(text):
+        return match_bracket(text, open_at)
+    close = match_bracket(text[open_at : open_at + limit], 0)
+    return None if close is None else open_at + close
+
+
+class BracketIndex:
+    """Matching brackets of a whole file from one linear pass.
+
+    ``close(open_at)`` answers what ``match_bracket`` would, in O(1), so code
+    that looks up many brackets in a large (possibly hostile) file stays
+    linear. A closer that doesn't match leaves every bracket still open
+    unmatched, as ``match_bracket`` does. ``brace_*`` list every `{...}` pair
+    in source order with its enclosing pair (-1 for none).
+    """
+
+    def __init__(self, text: str) -> None:
+        self._close: dict[int, int] = {}
+        self.brace_starts: list[int] = []
+        self.brace_ends: list[int] = []
+        self.brace_parents: list[int] = []
+        pairs = {"(": ")", "{": "}", "[": "]"}
+        # (expected closer, open offset, brace index or -1)
+        stack: list[tuple[str, int, int]] = []
+        braces: list[int] = []
+        n = len(text)
+        i = 0
+        while i < n:
+            skipped = _skip_literal(text, i)
+            if skipped is not None:
+                i = skipped
+                continue
+            c = text[i]
+            if c in pairs:
+                brace = -1
+                if c == "{":
+                    brace = len(self.brace_starts)
+                    self.brace_starts.append(i)
+                    self.brace_ends.append(n)
+                    self.brace_parents.append(braces[-1] if braces else -1)
+                    braces.append(brace)
+                stack.append((pairs[c], i, brace))
+            elif c in ")}]":
+                if stack and stack[-1][0] == c:
+                    _, open_at, brace = stack.pop()
+                    self._close[open_at] = i + 1
+                    if brace >= 0:
+                        self.brace_ends[brace] = i + 1
+                        braces.pop()
+                else:
+                    stack.clear()
+                    braces.clear()
+            i += 1
+
+    def close(self, open_at: int) -> int | None:
+        return self._close.get(open_at)
+
+
 def split_top_level(text: str, sep: str = ",") -> list[str]:
     """Split ``text`` on ``sep`` outside brackets and string literals."""
     parts: list[str] = []
@@ -388,6 +449,7 @@ def innermost_scope(scopes: list[ClassScope], offset: int) -> ClassScope | None:
 __all__ = [
     "Annotation",
     "AnnotationBlock",
+    "BracketIndex",
     "ClassScope",
     "annotation_paths",
     "class_scopes",
@@ -395,6 +457,7 @@ __all__ = [
     "group_blocks",
     "innermost_scope",
     "mask_comments",
+    "bracket_end",
     "match_bracket",
     "split_top_level",
     "string_values",

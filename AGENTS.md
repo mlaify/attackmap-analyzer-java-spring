@@ -20,6 +20,8 @@ Java/Kotlin Spring Boot ecosystem coverage:
 - **Web frameworks**: Spring MVC / Spring Boot (annotation routing with class-level `@RequestMapping` prefix joining), JAX-RS / Jersey / Quarkus, Ktor, Javalin, Micronaut
 - **Databases**: Spring Data JPA / MongoDB / Redis / Cassandra, JDBC (driver-aware), Hibernate, jOOQ, AWS SDK (S3 + DynamoDB)
 - **Auth**: Spring Security (`@PreAuthorize`, `@Secured`, `SecurityFilterChain`, `@EnableWebSecurity`), jjwt / nimbus-jose-jwt, BCrypt / Argon2 / SCrypt password encoders, OAuth2
+- **Route auth** (`security_dsl.py`): `authorizeHttpRequests` / `authorizeRequests` / `authorizeExchange` rules applied in first-match order, plus method security, recorded on `Route.auth` / `guards` / `guard_evidence` (core contract mlaify/AttackMap#256). Precision first: anything ambiguous stays `"unknown"`.
+- **Functional endpoints** (`functional.py`): `RouterFunctions`, the `route()` builder, Kotlin `router {}` / `coRouter {}` with nest prefixes.
 - **HTTP clients**: RestTemplate, WebClient, java.net.http.HttpClient, OkHttp, Apache HttpClient
 - **Secrets**: `System.getenv`, `@Value("${...}")`, `Environment.getProperty`
 - **Service hints**: `<artifactId>` from `pom.xml`, `rootProject.name` from Gradle settings, `spring.application.name` from properties/yml
