@@ -46,12 +46,14 @@ from .annotations import (
     Annotation,
     AnnotationBlock,
     annotation_paths,
-    string_values,
+    bracket_end,
     class_scopes,
     find_annotations,
     group_blocks,
     innermost_scope,
     mask_comments,
+    split_top_level,
+    string_values,
 )
 from .functional import FUNCTIONAL_GATE_RE, functional_routes
 from .security_dsl import (
@@ -165,6 +167,12 @@ YAML_LINE_RE = re.compile(r"([ ]*)([A-Za-z0-9_.\-]+)[ \t]*:(?:[ \t]+[\"']?([^\s#
 SERVLET_PATH_KEYS = {"spring.mvc.servlet.path": "mvc", "spring.jersey.application-path": "jersey"}
 MAX_YAML_LINES = 20_000
 APPLICATION_PATH_RE = re.compile(r"@ApplicationPath\s*\(")
+# The same set in code: `PathMatchConfigurer.addPathPrefix("/api", predicate)`, or
+# the DispatcherServlet registered on a sub-path (`new DispatcherServletRegistrationBean(
+# servlet, "/api/*")`, `new ServletRegistrationBean<>(dispatcherServlet, "/api/*")`).
+SERVLET_PREFIX_CALL_RE = re.compile(
+    r"\baddPathPrefix\s*\(|\b(DispatcherServletRegistrationBean|ServletRegistrationBean)\s*(?:<[^<>()]{0,100}>)?\s*\("
+)
 _ROOT_PATHS = frozenset({"", "/", "/*", "/**"})
 CONFIG_SUFFIXES = {".properties", ".yml", ".yaml"}
 # Spring Boot major version in a Maven or Gradle build file.
@@ -664,6 +672,8 @@ class JavaSpringAnalyzer:
             security.jakarta_files.add(relative)
         if APPLICATION_PATH_RE.search(content) and _application_path_not_root(content):
             security.jersey_path_files.add(relative)
+        if SERVLET_PREFIX_CALL_RE.search(content) and _code_mounts_mvc_below_root(content):
+            security.mvc_path_files.add(relative)
         if not security.trailing_slash_on and TRAILING_SLASH_ON_RE.search(content):
             security.trailing_slash_on = True
         switches = _method_security_switches(content)
@@ -1019,6 +1029,36 @@ def _application_path_not_root(content: str) -> bool:
         paths = annotation_paths(annotation, ("value",))
         if paths is None or any(p not in _ROOT_PATHS for p in paths):
             return True
+    return False
+
+
+def _code_mounts_mvc_below_root(content: str) -> bool:
+    """`addPathPrefix(..)` or a DispatcherServlet registration on a non-root (or
+    unreadable) path in Java/Kotlin code. A prefix applies to the controllers its
+    predicate selects; we don't read predicates, so the whole module counts."""
+    masked = mask_comments(content)
+    for count, m in enumerate(SERVLET_PREFIX_CALL_RE.finditer(masked)):
+        if count >= 64:
+            return True  # too many to read: assume the worst
+        close = bracket_end(masked, m.end() - 1, 5_000)
+        if close is None:
+            return True
+        parts = split_top_level(masked[m.end() : close - 1])
+        bean = m.group(1)
+        if bean is None:  # addPathPrefix(prefix, predicate)
+            mappings = parts[:1]
+        elif bean == "ServletRegistrationBean" and not (parts and "ispatcher" in parts[0]):
+            continue  # some other servlet (an H2 console, ...): MVC routes don't move
+        else:
+            mappings = parts[1:]
+        if not mappings:
+            if bean is None:
+                return True
+            continue  # a registration without mappings keeps the default "/"
+        for mapping in mappings:
+            values = string_values(mapping)
+            if values is None or any(v not in _ROOT_PATHS for v in values):
+                return True
     return False
 
 

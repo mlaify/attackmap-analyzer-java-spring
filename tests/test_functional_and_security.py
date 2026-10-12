@@ -1298,3 +1298,52 @@ def test_servlet_path_applies_only_to_its_module(tmp_path: Path) -> None:
     _write(tmp_path, "a/src/main/resources/application.properties", "spring.mvc.servlet.path=/app\n")
     by_module = {r.file.split("/")[0]: r.auth for r in JavaSpringAnalyzer().analyze(tmp_path).routes}
     assert by_module == {"a": "unknown", "b": "required"}
+
+
+# ---------- Review round 3: path prefixes set in code ----------
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            "class Web implements WebMvcConfigurer { public void configurePathMatch(PathMatchConfigurer c) {\n"
+            '    c.addPathPrefix("/api", HandlerTypePredicate.forAnnotation(RestController.class)); } }\n',
+            "unknown",
+        ),
+        (
+            "class Web implements WebMvcConfigurer { public void configurePathMatch(PathMatchConfigurer c) {\n"
+            "    c.addPathPrefix(Paths.API, h -> true); } }\n",
+            "unknown",
+        ),
+        (
+            'class Web { @Bean DispatcherServletRegistrationBean r(DispatcherServlet s) {\n'
+            '    return new DispatcherServletRegistrationBean(s, "/api/*"); } }\n',
+            "unknown",
+        ),
+        (
+            'class Web { @Bean ServletRegistrationBean<DispatcherServlet> r(DispatcherServlet dispatcherServlet) {\n'
+            '    return new ServletRegistrationBean<>(dispatcherServlet, "/api/*"); } }\n',
+            "unknown",
+        ),
+        # Another servlet on a sub-path doesn't move MVC routes.
+        (
+            'class Web { @Bean ServletRegistrationBean<WebServlet> h2() {\n'
+            '    return new ServletRegistrationBean<>(new WebServlet(), "/h2-console/*"); } }\n',
+            "required",
+        ),
+        (
+            'class Web { @Bean DispatcherServletRegistrationBean r(DispatcherServlet s) {\n'
+            '    return new DispatcherServletRegistrationBean(s, "/"); } }\n',
+            "required",
+        ),
+        # Mentioned only in a comment.
+        ('// c.addPathPrefix("/api", p);\nclass Web {}\n', "required"),
+    ],
+)
+def test_path_prefix_set_in_code_makes_spring_routes_unknown(tmp_path: Path, config: str, expected: str) -> None:
+    _write(tmp_path, "pom.xml", _BOOT3_POM)
+    _write(tmp_path, "src/main/java/Web.java", config)
+    _write(tmp_path, "src/main/java/Admin.java", '@RestController class Admin { @PostMapping("/admin/users") Object a() { return null; } }\n')
+    _write(tmp_path, "src/main/java/Sec.java", _sec('.requestMatchers("/admin/**").hasRole("ADMIN").anyRequest().permitAll()'))
+    assert _route(JavaSpringAnalyzer().analyze(tmp_path), "POST", "/admin/users").auth == expected

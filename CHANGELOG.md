@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shares a per-repo cost budget (segment and glob work included). Anything
   that can't be read with confidence is `unknown`: non-literal roles, SpEL
   beyond plain `and` / `or` terms, a non-root `spring.mvc.servlet.path` or
-  Jersey `@ApplicationPath`, and `UrlHandlerFilter` trailing-slash handling.
+  Jersey `@ApplicationPath`, a code-level `addPathPrefix(..)` or
+  DispatcherServlet registration on a sub-path, and `UrlHandlerFilter`
+  trailing-slash handling.
 
 ### Changed
 
