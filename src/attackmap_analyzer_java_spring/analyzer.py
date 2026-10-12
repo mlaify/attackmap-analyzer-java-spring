@@ -55,6 +55,7 @@ from .annotations import (
     split_top_level,
     string_values,
 )
+from .constants import ConstantTable, resolve_expression
 from .functional import FUNCTIONAL_GATE_RE, functional_routes
 from .security_dsl import (
     ANONYMOUS,
@@ -197,9 +198,18 @@ _DECISION_RANK = {None: 0, ANONYMOUS: 0, UNKNOWN: 1, REQUIRED: 2}
 @dataclass
 class MethodSecurity:
     family: str  # PREPOST / SECURED / JSR250
-    decision: str  # REQUIRED / ANONYMOUS / UNKNOWN
+    name: str  # the annotation, e.g. "PreAuthorize"
+    # Argument expressions; read once the repo's constants are known (#11).
+    sources: list[str]
     guard: str
     evidence: str
+    decision: str = UNKNOWN  # REQUIRED / ANONYMOUS / UNKNOWN, set by resolve()
+    resolved: bool = False
+
+    def resolve(self, constants: ConstantTable) -> None:
+        if not self.resolved:
+            self.decision = _method_decision(self.name, self.sources, constants)
+            self.resolved = True
 
 
 @dataclass
@@ -215,6 +225,10 @@ class RepoSecurity:
     """Security facts gathered while walking the repo, applied at the end."""
 
     files: dict[str, FileSecurity] = field(default_factory=dict)
+    # Comment-masked text of files with security rules, parsed once every
+    # constant in the repo is known.
+    pending: dict[str, str] = field(default_factory=dict)
+    constants: ConstantTable = field(default_factory=ConstantTable)
     # File -> method-security switches it turns on (PREPOST / SECURED / JSR250 / JAXRS_JSR250).
     switches: dict[str, set[str]] = field(default_factory=dict)
     # Main-source files importing `jakarta.servlet` (Spring 6: no trailing-slash
@@ -237,13 +251,8 @@ def _annotation_text(annotation: Annotation) -> str:
 
 
 def _method_security(block: AnnotationBlock | None, relative: str, content: str) -> list[MethodSecurity]:
-    """Method-security annotations in ``block`` with the access each declares.
-
-    `@PreAuthorize` SpEL is read like `access(...)`: an `or` branch, `isAnonymous()`,
-    `permitAll` or an ANONYMOUS authority means anonymous callers may get in.
-    `@Secured` / `@RolesAllowed` naming an ANONYMOUS authority, and `@PermitAll`,
-    open the method; `@DenyAll` and other roles require an authenticated caller.
-    """
+    """Method-security annotations in ``block``; their access is decided later
+    by `_method_decision`, once the repo's constants are known."""
     found: list[MethodSecurity] = []
     if block is None:
         return found
@@ -252,32 +261,48 @@ def _method_security(block: AnnotationBlock | None, relative: str, content: str)
         if family is None:
             continue
         sources = [*annotation.positional, *([annotation.named["value"]] if "value" in annotation.named else [])]
-        if annotation.name == "PreAuthorize":
-            # One Java/Kotlin string literal; a concatenation or constant is unreadable.
-            values = string_values(sources[0]) if len(sources) == 1 else None
-            if values is not None and len(values) == 1 and "$" not in values[0]:
-                decision = spel_decision(values[0].replace('\\"', '"'))
-            else:
-                decision = UNKNOWN
-        elif annotation.name in ("Secured", "RolesAllowed"):
-            roles: list[str] | None = [] if sources else None
-            for source in sources:
-                values = string_values(source)
-                if values is None or roles is None:
-                    roles = None
-                    break
-                roles.extend(values)
-            if not roles:
-                decision = UNKNOWN
-            else:
-                decision = ANONYMOUS if any(ANONYMOUS_AUTHORITY_RE.search(r) for r in roles) else REQUIRED
-        elif annotation.name == "DenyAll":
-            decision = REQUIRED
-        else:
-            decision = ANONYMOUS
         text = _annotation_text(annotation)
-        found.append(MethodSecurity(family, decision, text, f"{relative}:{line_of(content, annotation.start)} {text}"))
+        evidence = f"{relative}:{line_of(content, annotation.start)} {text}"
+        found.append(MethodSecurity(family, annotation.name, sources, text, evidence))
     return found
+
+
+def _array_elements(source: str) -> list[str]:
+    """Elements of `{a, b}`, Kotlin `[a, b]` / `arrayOf(a, b)`, or the value itself."""
+    v = source.strip()
+    if (v.startswith("{") and v.endswith("}")) or (v.startswith("[") and v.endswith("]")):
+        return split_top_level(v[1:-1])
+    if v.startswith("arrayOf(") and v.endswith(")"):
+        return split_top_level(v[len("arrayOf(") : -1])
+    return [v]
+
+
+def _method_decision(name: str, sources: list[str], constants: ConstantTable) -> str:
+    """The access one method-security annotation declares.
+
+    `@PreAuthorize` SpEL is read like `access(...)`, from one string literal or
+    literals and same-repo constants joined by `+`. `@Secured` / `@RolesAllowed`
+    naming an ANONYMOUS authority, and `@PermitAll`, open the method; `@DenyAll`
+    and other roles require an authenticated caller. Any argument that can't be
+    resolved makes the annotation UNKNOWN.
+    """
+    if name == "PreAuthorize":
+        expression = resolve_expression(sources[0], constants) if len(sources) == 1 else None
+        return spel_decision(expression) if expression is not None else UNKNOWN
+    if name in ("Secured", "RolesAllowed"):
+        roles: list[str] = []
+        for source in sources:
+            for element in _array_elements(source):
+                value = resolve_expression(element, constants)
+                if value is None:
+                    return UNKNOWN
+                roles.append(value)
+        if not roles:
+            return UNKNOWN
+        return ANONYMOUS if any(ANONYMOUS_AUTHORITY_RE.search(r) for r in roles) else REQUIRED
+    if name == "DenyAll":
+        return REQUIRED
+    return ANONYMOUS
 
 
 def _method_security_switches(content: str) -> set[str]:
@@ -679,11 +704,15 @@ class JavaSpringAnalyzer:
         switches = _method_security_switches(content)
         if switches:
             security.switches[relative] = switches
-        if not SECURITY_GATE_RE.search(content):
+        gated = SECURITY_GATE_RE.search(content) is not None
+        declares_constants = ("final" in content and "String" in content) or "const val" in content
+        if not gated and not declares_constants:
             return
-        parsed = parse_security(mask_comments(content), relative)
-        if parsed.chains or parsed.ignored:
-            security.files[relative] = parsed
+        masked = mask_comments(content)
+        if declares_constants:
+            security.constants.collect(masked)
+        if gated:
+            security.pending[relative] = masked
 
     def _apply_route_auth(
         self,
@@ -707,6 +736,11 @@ class JavaSpringAnalyzer:
         `Budget`; once that runs out the remaining routes keep the chain's answer
         unknown.
         """
+        for relative, masked in security.pending.items():
+            parsed = parse_security(masked, relative, security.constants)
+            if parsed.chains or parsed.ignored:
+                security.files[relative] = parsed
+        security.pending.clear()
         module_cache: dict[str, str] = {}
         chains_by_module: dict[str, list[SecurityChain]] = {}
         ignored_by_module: dict[str, list[Rule]] = {}
@@ -759,6 +793,9 @@ class JavaSpringAnalyzer:
             switches = switches_by_module.get(module, set()) | shared_switches
             method_security: MethodSecurity | None = None
             if meta.kind in FILTER_CHAIN_KINDS and meta.method_security:
+                for method_level, class_level in meta.method_security:
+                    for annotation in (*method_level, *class_level):
+                        annotation.resolve(security.constants)
                 effective = [_effective_method_security(levels, switches, meta.kind) for levels in meta.method_security]
                 # The least restrictive handler decides.
                 method_security = min(effective, key=lambda m: _DECISION_RANK[m.decision if m else None])

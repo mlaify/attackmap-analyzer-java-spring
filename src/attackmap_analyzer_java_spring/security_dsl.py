@@ -33,10 +33,12 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_right
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from .annotations import BracketIndex, bracket_end, split_top_level
+from .constants import EMPTY, ConstantTable, resolve_expression
 
 # Results of matching a route against a matcher.
 NONE, PARTIAL, FULL = 0, 1, 2
@@ -407,13 +409,15 @@ def match_path(
 # ---------- Argument readers ----------
 
 
+# The repo's string constants while a file's rules are parsed (#11).
+_CONSTANTS: ContextVar[ConstantTable] = ContextVar("java_spring_constants", default=EMPTY)
+
+
 def _string_literal(text: str) -> str | None:
-    m = _STRING_LITERAL_RE.fullmatch(text.strip())
-    if m is None:
-        return None
-    value = m.group(1)
-    # A Kotlin string template isn't a fixed pattern.
-    return None if "$" in value else value
+    """The string an argument evaluates to: a literal, or literals and same-repo
+    `Class.CONSTANT`s joined by `+`. None when it can't be read (a Kotlin
+    `$template`, an unknown or ambiguous constant, a call)."""
+    return resolve_expression(text, _CONSTANTS.get())
 
 
 def read_matcher_args(args: str, *, slash_safe: bool = False, depth: int = 0) -> Matcher:
@@ -525,6 +529,9 @@ def _decision(name: str, args: str | None) -> str:
         spel = _SPEL_ARG_RE.fullmatch(args)
         if spel is not None:
             return spel_decision(spel.group(1))
+        expression = _string_literal(args)
+        if expression is not None:
+            return spel_decision(expression)
         manager = _MANAGER_ARG_RE.fullmatch(args)
         if manager is not None:
             inner = args[args.index("(") + 1 : args.rindex(")")]
@@ -863,8 +870,18 @@ def _read_chained_matchers(masked: str, pos: int, end: int, brackets: BracketInd
     return matcher
 
 
-def parse_security(masked: str, file: str) -> FileSecurity:
-    """Every security chain and `web.ignoring()` rule in one comment-masked file."""
+def parse_security(masked: str, file: str, constants: ConstantTable | None = None) -> FileSecurity:
+    """Every security chain and `web.ignoring()` rule in one comment-masked file.
+
+    ``constants`` resolves class-qualified string constants in arguments."""
+    token = _CONSTANTS.set(constants or EMPTY)
+    try:
+        return _parse_security(masked, file)
+    finally:
+        _CONSTANTS.reset(token)
+
+
+def _parse_security(masked: str, file: str) -> FileSecurity:
     found = FileSecurity()
     if not SECURITY_GATE_RE.search(masked):
         return found
