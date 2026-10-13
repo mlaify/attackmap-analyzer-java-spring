@@ -40,7 +40,23 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
+    AnalyzerMetadata,
+    AuthHint,
+    DatabaseHint,
+    EntrypointHint,
+    ExternalCall,
+    FrameworkHint,
+    iter_repo_files,
+    line_of,
+    read_source,
+    rel,
+    Route,
+    ScanResult,
+    SecretHint,
+    ServiceHint,
+)
 
 from .annotations import (
     Annotation,
@@ -74,18 +90,6 @@ from .security_dsl import (
     spel_decision,
 )
 
-from .contracts import (
-    AnalyzerMetadata,
-    AuthHint,
-    DatabaseHint,
-    EntrypointHint,
-    ExternalCall,
-    FrameworkHint,
-    Route,
-    ScanResult,
-    SecretHint,
-    ServiceHint,
-)
 
 CODE_SUFFIXES = {".java", ".kt", ".kts"}
 # JVM-specific directories on top of the SDK defaults (which already cover
