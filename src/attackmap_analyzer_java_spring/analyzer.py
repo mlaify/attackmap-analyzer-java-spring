@@ -406,7 +406,17 @@ AUTH_PATTERNS: list[tuple[re.Pattern[str], str, float]] = [
     (re.compile(r'@PreAuthorize\s*\(|@PostAuthorize\s*\('), "spring_method_security", 0.9),
     (re.compile(r'@Secured\s*\(|@RolesAllowed\s*\('), "role_check", 0.85),
     (re.compile(r'\bWebSecurityConfigurerAdapter\b'), "spring_security_legacy", 0.85),
-    (re.compile(r'\bio\.jsonwebtoken\b|\bJwts\.\w+\(|\bJWT\.create\(|\bnimbusds\.jwt\b', re.IGNORECASE), "jwt", 0.85),
+    # JWT verification only (#9, AttackMap#325): core credits any auth hint near
+    # a route as that route's auth, and imports, `Jwts.builder()`, auth0/Hutool
+    # `JWT.create()` or a `JwtEncoder` sign tokens rather than check them.
+    (re.compile(
+        r'\.parse(?:ClaimsJws|SignedClaims|SignedContent|ContentJws)\s*\('  # jjwt (not parseClaimsJwt: unsigned)
+        r'|\bJWT\.require\s*\('                                            # auth0 java-jwt verifier
+        r'|\bJWTUtil\.verify\s*\(|\bJWTValidator\.of\s*\('                 # Hutool
+        r'|\bnew\s+(?:MAC|RSASSA|ECDSA|Ed25519)Verifier\s*\('              # Nimbus JOSE
+        r'|\bNimbusJwtDecoder\.with\w+\s*\(|\bJwtDecoders\.from\w+\s*\('   # Spring decoders
+        r'|\boauth2ResourceServer\s*[({][^;]{0,200}?\bjwt\b'                # Spring resource server
+    ), "jwt", 0.85),
     (re.compile(r'\bBCryptPasswordEncoder\b'), "bcrypt", 0.9),
     (re.compile(r'\bArgon2PasswordEncoder\b|\bargon2\b', re.IGNORECASE), "argon2", 0.9),
     (re.compile(r'\bSCryptPasswordEncoder\b'), "scrypt", 0.9),
