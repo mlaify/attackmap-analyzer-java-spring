@@ -305,11 +305,49 @@ def test_spring_security_signals(tmp_path: Path) -> None:
 def test_jjwt_emits_jwt_hint(tmp_path: Path) -> None:
     (tmp_path / "Jwt.java").write_text(
         'import io.jsonwebtoken.Jwts;\n'
-        'public class JwtDemo { String t() { return Jwts.builder().compact(); } }\n',
+        'public class JwtDemo { Claims c(String t) {\n'
+        '  return Jwts.parserBuilder().setSigningKey(k).build().parseClaimsJws(t).getBody(); } }\n',
         encoding="utf-8",
     )
     result = JavaSpringAnalyzer().analyze(tmp_path)
-    assert any(h.hint == "jwt" for h in result.auth_hints)
+    assert [h.line for h in result.auth_hints if h.hint == "jwt"] == [3]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "import io.jsonwebtoken.Jwts;\nimport com.nimbusds.jwt.SignedJWT;\n",
+        "// TODO: verify the JWT here\nclass A {}\n",
+        "class S { String s() { return Jwts.builder().setSubject(u).signWith(k).compact(); } }\n",
+        'class S { String s() { return JWT.create().withSubject(u).sign(alg); } }\n',
+        "class S { String s() { return JWTUtil.createToken(claims, key); } }\n",
+        "class S { Object p(String t) { return JWTUtil.parseToken(t).getPayloads(); } }\n",
+        "class S { Object u(String t) { return Jwts.parser().parseClaimsJwt(t); } }\n",
+        "class S { String e() { return jwtEncoder.encode(JwtEncoderParameters.from(h, c)).getTokenValue(); } }\n",
+    ],
+)
+def test_jwt_hint_needs_verification(tmp_path: Path, body: str) -> None:
+    (tmp_path / "Auth.java").write_text(body, encoding="utf-8")
+    result = JavaSpringAnalyzer().analyze(tmp_path)
+    assert not any(h.hint == "jwt" for h in result.auth_hints)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Jws<Claims> c = Jwts.parser().verifyWith(key).build().parseSignedClaims(token);",
+        'DecodedJWT d = JWT.require(Algorithm.HMAC256(s)).withIssuer("x").build().verify(token);',
+        "boolean ok = JWTUtil.verify(token, key);",
+        "boolean ok = signed.verify(new MACVerifier(secret));",
+        "return NimbusJwtDecoder.withSecretKey(key).macAlgorithm(MacAlgorithm.HS512).build();",
+        "http.oauth2ResourceServer(oauth2 -> oauth2.jwt(withDefaults()));",
+        "oauth2ResourceServer { jwt { } }",
+    ],
+)
+def test_jwt_hint_from_verification(tmp_path: Path, line: str) -> None:
+    (tmp_path / "Auth.java").write_text("class A {\n" + line + "\n}\n", encoding="utf-8")
+    hints = [h for h in JavaSpringAnalyzer().analyze(tmp_path).auth_hints if h.hint == "jwt"]
+    assert [h.line for h in hints] == [2]
 
 
 # ---------- Secrets ----------
@@ -467,6 +505,8 @@ def test_full_spring_boot_service_signal_set(tmp_path: Path) -> None:
         '    @PreAuthorize("hasRole(\'ADMIN\')")\n'
         '    @PostMapping("/admin/refund")\n'
         '    public Object refund() { return null; }\n'
+        '\n'
+        '    Object claims(String t) { return Jwts.parser().setSigningKey(secret).parseClaimsJws(t).getBody(); }\n'
         '\n'
         '    void fetch() {\n'
         '        RestTemplate restTemplate = new RestTemplate();\n'

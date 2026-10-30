@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — JWT auth hints need verification (#9, AttackMap#325)
+
+- The `jwt` auth hint used to match the `io.jsonwebtoken` / `nimbusds.jwt` package names (so any import), `Jwts.*(` (including `Jwts.builder()`), and `JWT.create(` (signing). It now needs verification:
+  - jjwt `parseClaimsJws` / `parseSignedClaims` / `parseSignedContent` / `parseContentJws` (not `parseClaimsJwt`, which is unsigned);
+  - auth0 `JWT.require(`;
+  - Hutool `JWTUtil.verify(` / `JWTValidator.of(`;
+  - Nimbus `new MAC|RSASSA|ECDSA|Ed25519Verifier(`;
+  - Spring `NimbusJwtDecoder.with*(` / `JwtDecoders.from*(`, and `oauth2ResourceServer(… jwt …)`, Java or Kotlin DSL.
+- Core credits any auth hint near a route as that route's auth.
+- Real repos, before → after:
+  - eladmin@55fbf70: the hint moved from the import to `parseClaimsJws`.
+  - mall@dcaa93b: Hutool's `JWTUtil.verify` is now found; nothing was found before.
+  - jhipster-sample-app@6b000b5: `oauth2ResourceServer(oauth2 -> oauth2.jwt(...))` and `NimbusJwtDecoder.withSecretKey` are now found.
+  - Routes and surface risk are unchanged. Core's repo-wide `unauth-outbound-integration` gate now sees a `jwt` hint in mall and jhipster, so those findings are gone (265 and 28 locations; tracked in AttackMap#395).
+
 ### Added
 
 - Same-repo `static final String` / Kotlin `const val` constants resolve in
