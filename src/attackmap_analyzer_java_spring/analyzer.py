@@ -595,7 +595,7 @@ class JavaSpringAnalyzer:
     metadata = AnalyzerMetadata(
         name="java-spring",
         display_name="Java/Kotlin Spring Boot Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="Java and Kotlin analyzer with Spring Boot, JAX-RS, Ktor, and Spring Security awareness.",
         scope="Maven, Gradle, and Kotlin Spring Boot projects. Detects Spring MVC, JAX-RS, Ktor, Javalin, and Micronaut routing.",
         targets=["java", "kotlin", "spring", "spring-boot"],
