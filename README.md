@@ -25,8 +25,8 @@ All emissions populate AttackMap's Signal v2 fields (line numbers, evidence snip
 ## Install
 
 ```bash
-uv tool install attackmap --with attackmap-analyzer-java-spring \
-  --index mlaify=https://pkg.mlaify.io/pypi/simple/ --index-strategy first-index
+uv tool install attackmap --with attackmap-analyzer-java-spring    # from PyPI
+# or: pip install attackmap-analyzer-java-spring    (installs attackmap too)
 # or from source:
 pip install git+https://github.com/mlaify/attackmap-analyzer-java-spring.git
 ```
