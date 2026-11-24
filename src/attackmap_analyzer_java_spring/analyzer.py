@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from attackmap.sdk import (
+    plugin_version,
     DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
@@ -595,7 +596,8 @@ class JavaSpringAnalyzer:
     metadata = AnalyzerMetadata(
         name="java-spring",
         display_name="Java/Kotlin Spring Boot Analyzer",
-        version="0.2.1",
+        version=plugin_version("attackmap-analyzer-java-spring", default="0.2.1"),
+        requires_core=">=0.8,<2",
         description="Java and Kotlin analyzer with Spring Boot, JAX-RS, Ktor, and Spring Security awareness.",
         scope="Maven, Gradle, and Kotlin Spring Boot projects. Detects Spring MVC, JAX-RS, Ktor, Javalin, and Micronaut routing.",
         targets=["java", "kotlin", "spring", "spring-boot"],
